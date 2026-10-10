@@ -68,6 +68,13 @@ def template_module():
     return module
 
 
+def firewall_module():
+    spec = importlib.util.spec_from_file_location('transitclient_firewall', PACKAGE / 'firewall_setup.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def select_template(value=None, rollback=False):
     catalog = template_module().catalog(PACKAGE)
     print('🎨 Сайты-заглушки')
@@ -275,12 +282,9 @@ def check_dns(config):
         raise Failure('DNS ещё не готов. Дождитесь готовности подготовки в боте.') from exc
     if not values or any(not ipaddress.ip_address(ip).is_global for ip in values):
         raise Failure('Все опубликованные A/AAAA должны вести на публичные IP релея.')
-    print('DNS A/AAAA: ' + ', '.join(sorted(values)))
     if config.get('relay_ip') and values != {config['relay_ip']}:
         raise Failure('A/AAAA не совпадают с ожидаемым IP релея. Проверьте DNS в боте; '
                       'лишний/неверный AAAA тоже блокирует проверку.')
-    if not config.get('relay_ip'):
-        print('Эти адреса должны принадлежать релею, а не backend клиента.')
 
 
 def require_host():
@@ -500,6 +504,11 @@ def open_firewall(config):
     status = run(['ufw', 'status']).stdout.decode()
     if 'Status: active' not in status:
         raise Failure('UFW не активен. Он не будет включён. Выберите manual осознанно.')
+    firewall = firewall_module()
+    try:
+        firewall.check_challenge_rules(run, config['challenge_port'])
+    except firewall.FirewallError as exc:
+        raise Failure(str(exc), exc.code) from exc
     tag = 'tenant-selfsteal-' + uuid.uuid4().hex
     assert_transient_available('tenant-selfsteal-watchdog.timer')
     assert_transient_available('tenant-selfsteal-watchdog.service')
@@ -510,9 +519,9 @@ def open_firewall(config):
     run(['systemd-run', '--unit=tenant-selfsteal-watchdog', '--on-active=25m',
          '--description=Transitclient firewall watchdog', '--timer-property=Description=Transitclient firewall watchdog',
          '--timer-property=AccuracySec=1s', '--collect', *hook])
-    run(['ufw', 'allow', f"{config['challenge_port']}/tcp", 'comment', tag])
-    # UFW skips an identical pre-existing rule, preserving its old comment.
-    # Cleanup matches only our tag, so that existing rule is never removed.
+    run(['ufw', 'prepend', 'allow', f"{config['challenge_port']}/tcp", 'comment', tag])
+    # prepend skips duplicates without updating their comments. Ordinary allow
+    # can retag a foreign rule, which must never become eligible for cleanup.
 
 
 def recover_certificate():
@@ -553,7 +562,7 @@ def recover_update():
             os.replace(INSTALL, failed)
         os.replace(backup, INSTALL)
     PACKAGE = INSTALL
-    for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py'):
+    for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py'):
         if (snapshot / name).exists():
             shutil.copy2(snapshot / name, STATE / name)
     if (STATE / 'certs/current').exists():
@@ -957,6 +966,7 @@ def install_units():
     os.replace(recovery, STATE / 'recover.py')
     shutil.copyfile(PACKAGE / 'diagnostics.py', STATE / 'diagnostics.py')
     shutil.copyfile(PACKAGE / 'site_templates.py', STATE / 'site_templates.py')
+    shutil.copyfile(PACKAGE / 'firewall_setup.py', STATE / 'firewall_setup.py')
     service = '''[Unit]
 Description=Tenant selfsteal HTTP-01 renewal
 After=network-online.target docker.service tenant-selfsteal-recover.service
@@ -1019,27 +1029,68 @@ def ask(label, default=''):
 
 
 def interactive_config(args):
-    print('🚀 Настройка клиента · три независимых порта')
-    config = {'domain': ask('Домен, выданный в боте', getattr(args, 'domain', None) or ''),
-              'vpn_port': ask('VPN inbound клиента', getattr(args, 'vpn_port', None) or 443),
-              'challenge_port': ask('Проверочный HTTP-порт из бота', getattr(args, 'challenge_port', None) or 8080),
-              'relay_ip': ask('Ожидаемый публичный IP релея (можно пропустить)', getattr(args, 'relay_ip', None) or ''),
-              'local_port': ask('Локальный HTTPS-порт selfsteal', getattr(args, 'local_port', None) or 9443),
-              'docker_network': ask('Docker-сеть VPN: пусто = host, иначе существующая bridge-сеть', getattr(args, 'docker_network', None) or ''),
-              'vpn_container': ask('VPN-контейнер для проверки сети (можно пропустить)', getattr(args, 'vpn_container', None) or ''),
-              'firewall': input('Firewall: active UFW или ручное управление [ufw/manual]: ') or 'ufw',
+    print('⚙️ Настройка')
+    config = {'domain': ask('Домен из бота', getattr(args, 'domain', None) or ''),
+              'vpn_port': ask('VPN-порт', getattr(args, 'vpn_port', None) or 443),
+              'challenge_port': ask('HTTP-порт из бота', getattr(args, 'challenge_port', None) or 8080),
+              'relay_ip': getattr(args, 'relay_ip', None) or '',
+              'local_port': ask('Локальный HTTPS-порт', getattr(args, 'local_port', None) or 9443),
+              'docker_network': getattr(args, 'docker_network', None) or '',
+              'vpn_container': getattr(args, 'vpn_container', None) or '',
+              'firewall': getattr(args, 'firewall', None) or 'ufw',
               'ca': STAGING if args.staging_ca_file else PRODUCTION,
               'staging_ca_file': str(Path(args.staging_ca_file).resolve()) if args.staging_ca_file else None,
               'package_url': '', 'package_version': '', 'package_sha256': '',
               'install_id': uuid.uuid4().hex, 'schema_version': 2}
     config = validate_config(config)
-    print(f"Домен: {config['domain']}; VPN: {config['vpn_port']}; HTTP-01: {config['challenge_port']}; "
-          f"selfsteal: {target(config)}; firewall: {config['firewall']}.")
-    print('Аренда ещё не запущена. Порт проверки должен совпадать с ботовым маршрутом.')
-    if config['firewall'] == 'manual':
-        print('Откройте выбранный TCP-порт в своём firewall/NAT для всех источников '
-              'на время установки и будущих продлений. Их очистка здесь не управляется.')
     return config
+
+
+def detect_vpn_network(config, report):
+    """Derive only the attributed listener's container, never guess from its image."""
+    containers = {row['name']: row for row in report.get('docker', {}).get('containers', [])
+                  if row['running']}
+    owners = {row.get('container') for row in report.get('selected_ports', {}).get('vpn', {}).get('listeners', [])}
+    candidates = sorted(name for name in owners if name in containers)
+    chosen = config.get('vpn_container')
+    if not chosen and len(candidates) == 1:
+        chosen = candidates[0]
+    elif not chosen and len(candidates) > 1:
+        print('На VPN-порту несколько контейнеров: ' + ', '.join(candidates))
+        chosen = ask('Контейнер ноды')
+        if chosen not in candidates:
+            raise Failure('Выберите контейнер из найденного списка.', 'VPN_CONTAINER_UNKNOWN')
+    if not chosen:
+        return
+    if chosen not in containers:
+        raise Failure('Указанный контейнер ноды не найден среди работающих.', 'VPN_CONTAINER_UNKNOWN')
+    config['vpn_container'] = chosen
+    mode = containers[chosen]['network_mode']
+    if mode == 'host':
+        if config.get('docker_network'):
+            raise Failure('Нода использует host; отдельная bridge-сеть ей недоступна.', 'VPN_NETWORK_MISSING')
+        print('Нода: ' + chosen + ' · host')
+        return
+    if mode in ('none',) or mode.startswith('container:'):
+        raise Failure('Сетевой режим ноды требует ручной настройки доступа к Caddy.', 'VPN_NETWORK_MISSING')
+    if config.get('docker_network'):
+        return
+    assert_local_docker()
+    networks = json.loads(run(['docker', 'inspect', '--format',
+                              '{{json .NetworkSettings.Networks}}', chosen]).stdout)
+    names = sorted(name for name in networks if name != 'bridge')
+    if len(names) == 1:
+        config['docker_network'] = names[0]
+    elif names:
+        print('Сети ноды: ' + ', '.join(names))
+        config['docker_network'] = ask('Общая сеть для Caddy')
+        if config['docker_network'] not in names:
+            raise Failure('Выбранная сеть недоступна ноде.', 'VPN_NETWORK_MISSING')
+    else:
+        raise Failure('Нода в стандартной bridge-сети. Нужна отдельная общая сеть по инструкции; '
+                      'контейнер ноды не изменён.', 'VPN_NETWORK_MISSING')
+    validate_config(config)
+    print('Нода: ' + chosen + ' · сеть ' + config['docker_network'])
 
 
 def check_install_resources():
@@ -1106,16 +1157,14 @@ def installation_plan(config):
     if not Path('/etc/ssl/certs/ca-certificates.crt').exists():
         missing.append('ca-certificates')
     print('\n📋 План установки')
-    print('  Caddy: Docker Compose, образ ' + manifest['caddy']['image'])
-    print('  Compose: ' + manifest['compose']['version'] + '; acme.sh: ' + manifest['acme']['version'])
-    print('  Недостающие пакеты: ' + (', '.join(missing) or 'нет'))
-    print(f'  Файлы: {INSTALL}, {CONFIG}, {STATE}; команда: {LAUNCHER}')
-    print('  Службы: tenant-selfsteal-{renew,recover}; таймер продления каждые 6 часов.')
-    print(f"  VPN {config.get('vpn_port') or 'не задан'}; HTTP {config['challenge_port']}; HTTPS {target(config)}")
-    print('  Только свой Caddy и временный HTTP-01. Сертификат: ' + ('STAGING' if config['ca'] == STAGING else "Let's Encrypt production"))
-    print('  Существующие сайты/VPN/контейнеры не перенастраиваются. transit не изменяется.')
-    print('  Сертификаты, ключи и ACME account сохраняются для повторов и отката.')
-    return confirm('Параметры совпадают с ботом, применить этот план?')
+    print('  Домен: ' + config['domain'])
+    print(f"  VPN {config.get('vpn_port') or '?'} · HTTP {config['challenge_port']} · HTTPS {target(config)}")
+    print('  Отдельный Caddy ' + manifest['caddy']['version'] + ' в Docker Compose.')
+    if missing:
+        print('  Установить пакеты: ' + ', '.join(missing))
+    print('  Сертификат: ' + ('тестовый' if config['ca'] == STAGING else "Let's Encrypt") + '; автоматическое продление.')
+    print('  Команда управления: transitclient. Нода и существующие сайты сохраняются.')
+    return confirm('Установить?')
 
 
 def install(args):
@@ -1125,9 +1174,9 @@ def install(args):
         PACKAGE = INSTALL
         print('📦 Сохранён собственный исходный пакет после удаления; используется его закреплённая версия.')
     diagnostics = diagnostic_module()
-    print('🔍 Диагностика перед установкой')
-    diagnostics.display(diagnostics.collect())
-    print('1 🚀 Отдельный Caddy · 2 📖 Существующий сервер по инструкции · 0 выход')
+    initial_report = diagnostics.collect()
+    diagnostics.display_compact(initial_report)
+    print('1 🚀 Установить Caddy · 2 📖 Свой веб-сервер · 0 Выход')
     mode = ask('Режим', '1')
     if mode == '2':
         guide(None)
@@ -1135,6 +1184,9 @@ def install(args):
     if mode != '1':
         raise Failure('Установка отменена.', 'CANCELLED')
     if CONFIG.exists():
+        if (STATE / 'ufw-activation.json').exists():
+            raise Failure('Незавершённая настройка UFW. Выполните sudo transitclient _recover, '
+                          'затем повторите установку.', 'FIREWALL_RECOVERY_REQUIRED')
         config = validate_config(read_json(CONFIG))
         print('Сохранены прежние настройки, ACME account и сертификат.')
         if INSTALL.exists() and PACKAGE != INSTALL:
@@ -1144,12 +1196,14 @@ def install(args):
             PACKAGE = INSTALL
     else:
         config = interactive_config(args)
+        report = diagnostics.collect(config)
+        detect_vpn_network(config, report)
         check_dns(config)
         check_challenge_port(config)
         if not config.get('docker_network') and not free_port(config['local_port'], '127.0.0.1'):
             raise Failure('Локальный HTTPS-порт занят; выберите другой, не останавливая процесс.', 'HTTPS_PORT_BUSY')
     report = diagnostics.collect(config)
-    diagnostics.display(report)
+    diagnostics.display_compact(report, ports=True)
     for check in report['checks']:
         if check['code'] in ('HTTP_PORT_BUSY', 'HTTPS_PORT_BUSY', 'DOCKER_CONTEXT_UNSAFE', 'DOCKER_INVENTORY_FAILED',
                              'CONTAINER_INSPECT_FAILED', 'DNS_RELAY_MISMATCH', 'DNS_LOOKUP_FAILED'):
@@ -1166,11 +1220,13 @@ def install(args):
         print('⚠️ VPN не подтверждён. Установщик не устанавливает ноду и не проверяет REALITY credentials.')
         if not confirm('Продолжить только подготовку selfsteal?'):
             raise Failure('Подготовка отменена.', 'CANCELLED')
-    if config['firewall'] == 'ufw':
-        response = run(['ufw', 'status'], check=False)
-        if response.returncode or b'Status: active' not in response.stdout:
-            raise Failure('UFW не активен. Установщик не включает его и не меняет SSH. '
-                          'Подготовьте firewall либо выберите manual.', 'FIREWALL_NOT_READY')
+    firewall = firewall_module()
+    try:
+        firewall_plan = firewall.plan(config, report, run)
+    except firewall.FirewallError as exc:
+        raise Failure(str(exc), exc.code) from exc
+    for change in firewall_plan['changes']:
+        print('🛡️ ' + change)
     chosen_template = None
     if not CONFIG.exists() or getattr(args, 'template', None) is not None:
         chosen_template = select_template(getattr(args, 'template', None))
@@ -1213,6 +1269,10 @@ def install(args):
         render_caddy(config)
         # Recovery is installed before issuance, not after a successful first run.
         install_units()
+        try:
+            firewall.apply(firewall_plan, config, STATE, run, atomic_json)
+        except firewall.FirewallError as exc:
+            raise Failure(str(exc), exc.code) from exc
         if chosen_template is not None:
             change_template(config, chosen_template, approved=True)
         if (STATE / 'certs/current').exists():
@@ -1266,8 +1326,19 @@ def status(config, diagnose=False, json_output=False):
                               'target': target(config) if config else None,
                               'caddy_image': dependency_lock()['caddy']['image'],
                               'certificate': certificate_status(config)}
-    report['pending'] = [name for name in ('firewall.json', 'certificate-transaction.json',
+    report['pending'] = [name for name in ('firewall.json', 'ufw-activation.json', 'certificate-transaction.json',
                          'configuration-transaction.json', 'update-transaction.json', 'site-transaction.json') if (STATE / name).exists()]
+    preparation = STATE / 'ufw-package-preparation.json'
+    if preparation.exists():
+        try:
+            if read_json(preparation).get('status') != 'installed':
+                report['pending'].append(preparation.name)
+                report['checks'].append({'code': 'UFW_PACKAGE_PREPARATION_PENDING', 'status': 'error',
+                                        'message': 'Установка UFW не завершена; резервная копия сохранена. Повторите install после проверки пакета.'})
+        except (OSError, ValueError, AttributeError):
+            report['pending'].append(preparation.name)
+            report['checks'].append({'code': 'UFW_PACKAGE_PREPARATION_UNREADABLE', 'status': 'error',
+                                    'message': 'Не удалось прочитать журнал подготовки UFW.'})
     try:
         site = read_json(STATE / 'site-template.json') if (STATE / 'site-template.json').exists() else {}
         report['installation']['site'] = {key: site[key] for key in ('id', 'name', 'commit') if key in site}
@@ -1329,7 +1400,7 @@ def status(config, diagnose=False, json_output=False):
 
 def guide(config):
     print('📖 Существующий веб-сервер: интеграция только по инструкции.')
-    print('Инструкция, резервная копия, validate/reload и откат: ' + str(PACKAGE / 'docs/integration.md'))
+    print('Инструкция: https://github.com/donkyboss1/transitclient/blob/main/docs/integration.md')
     if config:
         print('REALITY (несекретные поля): ' + json.dumps({'target': target(config), 'xver': 0,
                                                         'serverNames': [config['domain']]}, ensure_ascii=False))
@@ -1464,7 +1535,7 @@ def update(config, args):
             tar.extractall(extracted, members=members)
         if (extracted / 'VERSION').read_text().strip() != version:
             raise Failure('Версия артефакта не совпадает с выбранной.')
-        for name in ('selfsteal.py', 'selfsteal.sh', 'diagnostics.py', 'site_templates.py', 'templates.json', 'vendor/acme.sh', 'dependencies.json', 'docs/integration.md'):
+        for name in ('selfsteal.py', 'selfsteal.sh', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'templates.json', 'vendor/acme.sh', 'dependencies.json', 'docs/integration.md'):
             if not (extracted / name).is_file():
                 raise Failure('Неполный артефакт обновления.')
         deps = read_json(extracted / 'dependencies.json')
@@ -1483,7 +1554,7 @@ def update(config, args):
         shutil.copytree(extracted, candidate)
         snapshot = STATE / ('update-backup-' + identifier)
         snapshot.mkdir(mode=0o700)
-        for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py'):
+        for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py'):
             if (STATE / name).exists():
                 shutil.copy2(STATE / name, snapshot / name)
         atomic_json(STATE / 'update-transaction.json', {'id': identifier})
@@ -1587,6 +1658,12 @@ def dispatch(args):
                 vpn_self_test(config)
             return 0
         check_install_resources()
+        if (STATE / 'ufw-activation.json').exists():
+            firewall = firewall_module()
+            try:
+                firewall.recover_activation(STATE, run, atomic_json)
+            except firewall.FirewallError as exc:
+                raise Failure(str(exc), exc.code) from exc
         abort_acme()
         recover_update()
         recover_configuration()
@@ -1656,6 +1733,7 @@ def main():
     parser.add_argument('--local-port')
     parser.add_argument('--docker-network')
     parser.add_argument('--vpn-container')
+    parser.add_argument('--firewall', choices=['ufw', 'manual'], help='Управление UFW (по умолчанию) или собственный firewall')
     parser.add_argument('--probe-token', help=argparse.SUPPRESS)
     parser.add_argument('--json', action='store_true', help='JSON отчёт status/diagnose/self-test')
     parser.add_argument('--no-color', action='store_true', help='Без ANSI цветов (по умолчанию)')

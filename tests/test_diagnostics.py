@@ -137,6 +137,24 @@ def test_existing_server_and_conflicts_are_reported_together(diagnostics, monkey
     assert nginx['active'] and nginx['installed'] and nginx['unit'] == 'nginx.service'
 
 
+def test_node_listener_on_443_is_not_reported_as_web_server(diagnostics, monkeypatch, capsys):
+    monkeypatch.setattr(diagnostics.shutil, 'which', lambda name: None)
+    report = {
+        'checks': [], 'systemd': {'available': False},
+        'docker': {'containers': []}, 'web_servers': [],
+        'listeners': diagnostics.parse_ss('LISTEN 0 4096 *:443 *:* users:(("rw-core",pid=41829,fd=7))'),
+        'os': {'id': 'ubuntu', 'version': '26.04', 'architecture': 'x86_64'},
+        'firewall': {'ufw': 'inactive'},
+    }
+    diagnostics._web_inventory(report)
+    assert 'EXISTING_WEB_SERVER' not in codes(report)
+    assert 'OTHER_WEB_PORT_LISTENER' in codes(report)
+    diagnostics.display_compact(report)
+    output = capsys.readouterr().out
+    assert 'rw-core' not in output and 'EXISTING_WEB_SERVER' not in output
+    assert 'UFW: выключен' in output
+
+
 def test_unavailable_docker_cannot_prove_port_available_via_empty_ss(diagnostics, monkeypatch):
     monkeypatch.setattr(diagnostics, '_run', lambda args: '' if args[0] == 'ss' else None)
     report = diagnostics.collect()

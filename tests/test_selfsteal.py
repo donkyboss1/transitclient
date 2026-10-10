@@ -60,6 +60,50 @@ def test_defaults_and_same_port_validation(app, config):
         app.validate_config(config)
 
 
+def test_first_setup_only_asks_domain_and_three_ports(app, monkeypatch):
+    answers = iter(['node.example.com', '', '', ''])
+    prompts = []
+    def respond(prompt):
+        prompts.append(prompt)
+        return next(answers)
+    monkeypatch.setattr('builtins.input', respond)
+    saved = app.interactive_config(SimpleNamespace(staging_ca_file=None))
+    assert len(prompts) == 4
+    assert not any(word in ' '.join(prompts) for word in ('IP', 'Docker', 'Firewall', 'контейнер'))
+    assert saved['vpn_port'] == 443 and saved['challenge_port'] == 8080 and saved['local_port'] == 9443
+    assert saved['firewall'] == 'ufw' and saved['relay_ip'] == ''
+
+
+def test_host_node_is_attributed_without_network_questions(app, config, monkeypatch):
+    monkeypatch.setattr('builtins.input', lambda *_: pytest.fail('Host node needs no network questions'))
+    monkeypatch.setattr(app, 'run', lambda *_: pytest.fail('Do not inspect or change host container'))
+    config.update(vpn_port=443)
+    report = {'docker': {'containers': [{'name': 'remnanode', 'running': True, 'network_mode': 'host'}]},
+              'selected_ports': {'vpn': {'listeners': [{'container': 'remnanode'}]}}}
+    app.detect_vpn_network(config, report)
+    assert config['vpn_container'] == 'remnanode' and not config.get('docker_network')
+
+
+def test_unattributed_container_is_not_guessed_from_its_image(app, config):
+    report = {'docker': {'containers': [{'name': 'node', 'running': True, 'network_mode': 'host'}]},
+              'selected_ports': {'vpn': {'listeners': [{'processes': [{'name': 'unknown'}]}]}}}
+    app.detect_vpn_network(config, report)
+    assert not config.get('vpn_container')
+
+
+def test_single_existing_bridge_network_is_selected_without_modifying_node(app, config, monkeypatch):
+    import json
+    calls = []
+    monkeypatch.setattr(app, 'assert_local_docker', lambda: None)
+    monkeypatch.setattr(app, 'run', lambda args, **_: calls.append(args) or result(output=json.dumps({'vpn-net': {}}).encode()))
+    config.update(vpn_port=443)
+    report = {'docker': {'containers': [{'name': 'node', 'running': True, 'network_mode': 'vpn-net'}]},
+              'selected_ports': {'vpn': {'listeners': [{'container': 'node'}]}}}
+    app.detect_vpn_network(config, report)
+    assert config['docker_network'] == 'vpn-net'
+    assert all(call[:2] == ['docker', 'inspect'] for call in calls)
+
+
 def test_busy_challenge_keeps_order_port_and_suggests_bot(app, config, monkeypatch):
     monkeypatch.setattr(app, 'free_port', lambda port, *a: port == 8081)
     with pytest.raises(app.Failure, match='Измените порт в боте'):
@@ -81,6 +125,9 @@ def test_dns_compares_relay_and_blocks_wrong_aaaa(app, config, monkeypatch):
 
 
 def test_firewall_intent_persisted_before_add_and_cleanup_number_changes(app, config, monkeypatch):
+    firewall = app.firewall_module()
+    monkeypatch.setattr(firewall, '_vendor_configuration', lambda _: None)
+    monkeypatch.setattr(app, 'firewall_module', lambda: firewall)
     calls, rules = [], []
 
     def fake_run(args, **kwargs):
@@ -90,7 +137,7 @@ def test_firewall_intent_persisted_before_add_and_cleanup_number_changes(app, co
         if args[:2] == ['systemd-run', '--unit=tenant-selfsteal-watchdog']:
             assert (app.STATE / 'firewall.json').exists()
             return result()
-        if args[:2] == ['ufw', 'allow']:
+        if args[:3] == ['ufw', 'prepend', 'allow']:
             tag = args[-1]
             assert app.read_json(app.STATE / 'firewall.json')['tag'] == tag
             rules.extend([f'[ 2] 8080/tcp ALLOW IN Anywhere # {tag}',
@@ -115,6 +162,9 @@ def test_firewall_intent_persisted_before_add_and_cleanup_number_changes(app, co
 
 
 def test_existing_allow_not_removed_when_ufw_skips_duplicate(app, config, monkeypatch):
+    firewall = app.firewall_module()
+    monkeypatch.setattr(firewall, '_vendor_configuration', lambda _: None)
+    monkeypatch.setattr(app, 'firewall_module', lambda: firewall)
     calls = []
 
     def fake_run(args, **kwargs):
@@ -125,6 +175,7 @@ def test_existing_allow_not_removed_when_ufw_skips_duplicate(app, config, monkey
     monkeypatch.setattr(app, 'check_challenge_port', lambda c: None)
     app.open_firewall(config)
     app.cleanup_firewall()
+    assert any(c[:3] == ['ufw', 'prepend', 'allow'] for c in calls)
     assert not any(c[:3] == ['ufw', '--force', 'delete'] for c in calls)
 
 
@@ -144,12 +195,15 @@ def test_firewall_delete_failure_retains_marker_for_boot_recovery(app, monkeypat
 
 
 def test_add_failure_marker_can_be_reconciled_after_kill(app, config, monkeypatch):
+    firewall = app.firewall_module()
+    monkeypatch.setattr(firewall, '_vendor_configuration', lambda _: None)
+    monkeypatch.setattr(app, 'firewall_module', lambda: firewall)
     monkeypatch.setattr(app, 'check_challenge_port', lambda c: None)
 
     def fake_run(args, **kwargs):
         if args == ['ufw', 'status']:
             return result(output=b'Status: active')
-        if args[:2] == ['ufw', 'allow']:
+        if args[:3] == ['ufw', 'prepend', 'allow']:
             raise app.Failure('killed after intent')
         return result()
 
@@ -604,6 +658,16 @@ def test_status_before_install_has_no_lifecycle_or_recovery(app, monkeypatch, ca
     assert not app.CONFIG.exists() and not app.LOCK.exists()
 
 
+@pytest.mark.parametrize('stage,pending', [('installing', True), ('installed', False)])
+def test_status_reports_interrupted_ufw_package_preparation(app, monkeypatch, stage, pending):
+    app.atomic_json(app.STATE / 'ufw-package-preparation.json', {'status': stage})
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: SimpleNamespace(collect=lambda _: {'checks': []}))
+    monkeypatch.setattr(app, 'run', lambda *a, **k: result())
+    report = app.status(None, json_output=True)
+    assert ('ufw-package-preparation.json' in report['pending']) == pending
+    assert any(row['code'] == 'UFW_PACKAGE_PREPARATION_PENDING' for row in report['checks']) == pending
+
+
 def test_abort_never_stops_foreign_transient_unit(app, monkeypatch):
     calls = []
     monkeypatch.setattr(app, 'run', lambda args, **kw: calls.append(args) or
@@ -721,7 +785,7 @@ def test_transient_description_alone_is_not_ownership(app, monkeypatch):
 def test_install_docker_nat_conflict_is_read_only(app, config, monkeypatch):
     from types import SimpleNamespace
     diagnostics = SimpleNamespace(collect=lambda *_: {'checks': [{'code': 'HTTP_PORT_BUSY', 'status': 'error', 'message': 'Docker DNAT conflict'}]},
-                                  display=lambda _: None)
+                                  display_compact=lambda *_, **__: None)
     monkeypatch.setattr(app, 'check_install_resources', lambda: None)
     monkeypatch.setattr(app, 'diagnostic_module', lambda: diagnostics)
     monkeypatch.setattr(app, 'interactive_config', lambda _: config)

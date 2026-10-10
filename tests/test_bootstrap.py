@@ -28,7 +28,8 @@ def release(tmp_path, additions=(), omit=(), version='1.2.3', bad_acme=False,
             controller=b'raise SystemExit(0)\n'):
     acme = b'#!/bin/sh\nexit 0\n'
     files = {'selfsteal.py': controller, 'selfsteal.sh': b'#!/bin/bash\n',
-             'diagnostics.py': b'# diagnostics\n', 'site_templates.py': b'# templates\n', 'templates.json': b'{}',
+             'diagnostics.py': b'# diagnostics\n', 'site_templates.py': b'# templates\n',
+             'firewall_setup.py': b'# firewall\n', 'templates.json': b'{}',
              'docs/integration.md': b'# Integration\n',
              'VERSION': version.encode(), 'LICENSE': b'MIT', 'NOTICE.md': b'DigneZzZ',
              'site/index.html': b'<p>Hello</p>', 'vendor/acme.sh': acme,
@@ -93,7 +94,7 @@ def test_pinned_hash_failure_cannot_write_or_run_payload(extractor, tmp_path):
     assert not args[1].exists()
 
 
-@pytest.mark.parametrize('omit', ['vendor/acme.sh', 'site/index.html', 'LICENSE', 'NOTICE.md', 'site_templates.py', 'templates.json'])
+@pytest.mark.parametrize('omit', ['vendor/acme.sh', 'site/index.html', 'LICENSE', 'NOTICE.md', 'site_templates.py', 'firewall_setup.py', 'templates.json'])
 def test_incomplete_release_rejected(extractor, tmp_path, omit):
     args = release(tmp_path, omit=[omit])
     with pytest.raises(ValueError, match='неполон'):

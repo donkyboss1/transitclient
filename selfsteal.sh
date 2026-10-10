@@ -133,7 +133,7 @@ def safe_extract(archive_path, destination, version, digest):
         raise ValueError('SHA256 релиза не совпадает; запуск запрещён.')
     if destination.exists() or destination.is_symlink():
         raise ValueError('Каталог распаковки уже существует.')
-    required = {'selfsteal.sh', 'selfsteal.py', 'diagnostics.py', 'site_templates.py', 'templates.json', 'docs/integration.md', 'dependencies.json', 'VERSION',
+    required = {'selfsteal.sh', 'selfsteal.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'templates.json', 'docs/integration.md', 'dependencies.json', 'VERSION',
                 'LICENSE', 'NOTICE.md', 'vendor/acme.sh', 'site/index.html'}
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0

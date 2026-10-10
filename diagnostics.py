@@ -230,8 +230,11 @@ def _web_inventory(report):
     unidentified = [row for row in report['listeners'] if row['port'] in (80, 443)
                     and not any(proc['name'].lower() in names for proc in row['processes'])]
     report['other_web_port_listeners'] = unidentified
-    if report['web_servers'] or unidentified:
-        _check(report, 'EXISTING_WEB_SERVER', 'warning', 'Обнаружен веб-сервер или слушатель на 80/443. Чужие службы, конфигурации и контейнеры сохраняются.')
+    if report['web_servers']:
+        _check(report, 'EXISTING_WEB_SERVER', 'warning', 'Обнаружен веб-сервер. Его службы, конфигурация и контейнеры сохраняются.')
+    if unidentified:
+        _check(report, 'OTHER_WEB_PORT_LISTENER', 'unknown',
+               'На 80/443 есть другой TCP-слушатель; наличие веб-сервера не подтверждено.')
 
 
 def _attribute_processes(report):
@@ -286,7 +289,7 @@ selected_ports and dns. statuses are ok/warning/error/unknown.
                            'inactive' if ufw and 'Status: inactive' in ufw else 'unknown'}
     _check(report, 'LOCAL_FIREWALL', 'ok' if report['firewall']['ufw'] == 'active' else 'unknown',
            'UFW активен; чужие правила сохраняются.' if report['firewall']['ufw'] == 'active' else
-           'UFW не активен либо недоступен. Нужен осознанный manual firewall; внешний firewall/NAT проверяется отдельно.')
+           'UFW не активен либо недоступен. Установка подготовит его после проверки SSH и служб; внешний firewall/NAT проверяется отдельно.')
     clock = _run(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value']) if shutil.which('timedatectl') else None
     _check(report, 'SYSTEM_CLOCK', 'ok' if clock and clock.strip() == 'yes' else 'unknown',
            'Системное время синхронизировано.' if clock and clock.strip() == 'yes' else
@@ -351,6 +354,33 @@ selected_ports and dns. statuses are ok/warning/error/unknown.
         except (OSError, ValueError):
             _check(report, 'DNS_LOOKUP_FAILED', 'error', 'DNS домена не разрешается; дождитесь готовности подготовки в боте.')
     return report
+
+
+def display_compact(report, ports=False):
+    """Installer summary; the full inventory remains available in diagnose."""
+    system = report.get('os', {})
+    if not ports:
+        print('🔍 ' + ' '.join(str(system.get(key, '')) for key in ('id', 'version', 'architecture')).strip())
+        docker = report.get('docker', {})
+        print('Docker: ' + ('доступен' if docker.get('local') and docker.get('available') else 'нужна подготовка'))
+        firewall = report.get('firewall', {}).get('ufw')
+        print('UFW: ' + {'active': 'включён', 'inactive': 'выключен'}.get(firewall, 'нужна проверка'))
+        for server in report.get('web_servers', []):
+            print('⚠️ Веб-сервер: ' + server['name'] + '. Его настройки сохраняются.')
+    else:
+        labels = {'vpn': 'Нода', 'challenge': 'HTTP', 'local': 'HTTPS'}
+        for role, selected in report.get('selected_ports', {}).items():
+            listeners = selected['listeners']
+            if role == 'vpn':
+                owners = sorted({row.get('container') or ', '.join(p['name'] for p in row.get('processes', []))
+                                 or 'процесс неизвестен' for row in listeners})
+                detail = ', '.join(owners) if owners else 'слушатель не найден'
+            else:
+                detail = 'занят' if listeners else 'свободен'
+            print(f"{labels[role]}: {selected['port']} · {detail}")
+    for item in report.get('checks', []):
+        if item['status'] == 'error':
+            print('❌ [' + item['code'] + '] ' + item['message'])
 
 
 def display(report):

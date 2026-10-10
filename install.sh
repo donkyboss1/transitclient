@@ -6,9 +6,9 @@ set -euo pipefail
 umask 077
 
 # Publication fills these three values together. Never guess a repository URL.
-RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.2.1.tar.gz'
-RELEASE_VERSION='1.2.1'
-RELEASE_SHA256='2150b03b72ee9e67ea030374e739bce291ce1c0ac287b95abaef520695406cb8'
+RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.3.0.tar.gz'
+RELEASE_VERSION='1.3.0'
+RELEASE_SHA256='4342edca87bd7b354d70138d3f32d461e2b8630be32c87f3fe3fc94e4e9b6555'
 
 fail() { printf '\n❌ %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -133,7 +133,7 @@ def safe_extract(archive_path, destination, version, digest):
         raise ValueError('SHA256 релиза не совпадает; запуск запрещён.')
     if destination.exists() or destination.is_symlink():
         raise ValueError('Каталог распаковки уже существует.')
-    required = {'selfsteal.sh', 'selfsteal.py', 'diagnostics.py', 'site_templates.py', 'templates.json', 'docs/integration.md', 'dependencies.json', 'VERSION',
+    required = {'selfsteal.sh', 'selfsteal.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'templates.json', 'docs/integration.md', 'dependencies.json', 'VERSION',
                 'LICENSE', 'NOTICE.md', 'vendor/acme.sh', 'site/index.html'}
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0

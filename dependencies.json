@@ -1,0 +1,22 @@
+{
+  "acme": {
+    "version": "3.1.6",
+    "url": "https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh",
+    "sha256": "c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7"
+  },
+  "caddy": {
+    "version": "2.11.4-alpine",
+    "image": "caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b"
+  },
+  "compose": {
+    "version": "v5.6.0",
+    "x86_64": {
+      "url": "https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64",
+      "sha256": "40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a"
+    },
+    "aarch64": {
+      "url": "https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-aarch64",
+      "sha256": "733ec76717ceb59052a9609b9dadfb523b2df8eab57a54212872d10a58078ea2"
+    }
+  }
+}

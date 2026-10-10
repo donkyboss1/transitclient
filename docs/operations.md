@@ -1,0 +1,148 @@
+# 🔐 Продление, восстановление и приёмка
+
+## Сайты-заглушки
+
+`sudo transitclient template` открывает каталог из 11 сайтов. `r` выбирает
+случайный, `0` возвращает встроенную страницу, `b` откатывает прежний сайт.
+Можно выбрать номер сразу: `sudo transitclient template --template 8`.
+При первой установке выбор предлагается перед подтверждением плана.
+
+Файлы скачиваются из закреплённого upstream-коммита с проверкой размера и SHA256.
+Живой сайт не очищается перед загрузкой. Проверенный сайт применяется в собственном
+`site/current`, прежний сохраняется в `site/backups`. Проверяется HTTPS-ответ Caddy;
+ошибка возвращает прежние файлы. Журнал смены позволяет откатиться после reboot.
+Сертификат, ключ, порты и чужие сайты не меняются.
+
+При обновлении с 1.1 прежний пользовательский сайт сохраняется. Caddy обслуживает
+только активный сайт; резервные копии не публикуются. Неудача загрузки не вызывает
+скрытую замену выбранного сайта встроенной страницей.
+
+## Файлы
+
+| Путь | Назначение |
+| --- | --- |
+| `/usr/local/bin/transitclient` | Собственный launcher с маркером владения |
+| `/opt/tenant-selfsteal` | Runtime пакета |
+| `/opt/tenant-selfsteal/.transitclient-package.json` | Маркер своего пакета и SHA256 контроллера для повторной установки после удаления |
+| `/etc/tenant-selfsteal/config.json` | Root-only конфигурация 0600 |
+| `/var/lib/tenant-selfsteal/acme` | Сохраняемый ACME account |
+| `/var/lib/tenant-selfsteal/certs/<generation>` | Закрытые поколения cert/key |
+| `/var/lib/tenant-selfsteal/certs/current` | Атомарная ссылка на действующее поколение |
+| `/var/lib/tenant-selfsteal/{Caddyfile,compose.yaml,site}` | Свой Compose-проект |
+
+Монтируется каталог certs; смена `current` видна Caddy. Ключ не пересылается.
+ACME — отдельная программа, automatic HTTPS своего Caddy отключён.
+
+## Firewall и HTTP-01
+
+`ufw` допустим только при уже активном UFW. Установщик не включает firewall,
+не сбрасывает policy/SSH и не меняет чужие правила. Помеченное UUID правило
+создаётся pre-hook фактического выпуска и очищается post-hook/watchdog/recovery.
+Если разрешение уже было и UFW пропустил дубликат, прежнее правило остаётся.
+В `manual` настройте firewall/NAT сами; автоматическая очистка чужих правил
+не обещается. Между выпусками нет постоянного HTTP-сервиса на проверочном порту.
+Только `self-test --http01` явно создаёт временный вход без ACME order.
+Проверка с backend не заменяет внешнюю проверку при NAT hairpin.
+
+## Продление и сертификат
+
+```bash
+sudo transitclient status
+sudo transitclient diagnose
+sudo transitclient renew
+sudo systemctl list-timers tenant-selfsteal-renew.timer
+sudo journalctl -u tenant-selfsteal-renew.service --since today
+```
+
+Timer каждые 6 часов с jitter до 45 минут сохраняет пропущенные запуски.
+acme.sh 3.1.6 учитывает ARI/своё расписание: нет допущения «90 дней», `--force`
+выпуска, acme cron и auto-upgrade. До due pre-hook не вызывается.
+CLI/timer используют общий lock; status/diagnose не запускают ACME/recovery.
+
+Смена версии существующей установки выполняется через `update` с проверенным
+архивом, версией и SHA256. Запуск нового внешнего пакета через `install` не
+переписывает прежний runtime. Legacy VPN-порт остаётся неизвестным до явного
+ввода в configure; account и работающий сертификат при обновлении сохраняются.
+
+Для проверки target из заданного VPN-контейнера используйте
+`sudo transitclient self-test --vpn`. После подтверждения выполняется только
+имеющийся `openssl s_client`; пакеты и образ ноды не меняются. Если OpenSSL
+или CA bundle отсутствуют, результат остаётся неподтверждённым: используйте
+собственный диагностический контейнер в той же сети. STAGING trust в чужую
+ноду автоматически не копируется и системное доверие не изменяется.
+
+Перед переключением проверяются SAN, срок, trust chain и ключ. Caddy reload
+использует `--force`, затем сверяется реальный TLS с SNI/h2. Ошибка возвращает
+прежнее поколение/reload; при первом неудачном применении останавливается только
+новый собственный Caddy. Поколения остаются backup. Сертификат на диске без
+успешного применения не считается результатом.
+
+При смене HTTP-порта сначала измените подготовку в боте, дождитесь применения,
+затем `configure`. При смене HTTPS вручную обновите VPN target. Config/account
+и сертификат сохраняются; configure не вызывает CA. Перед renew порт/hooks
+синхронизируются в приватном domain.conf.
+
+ACME запускается в transient systemd cgroup с 15-минутным пределом, остановкой
+дочерних listener и cleanup через ExecStopPost. Renewal service имеет
+20-минутный предел. До firewall-изменения сохраняется marker и запускается
+25-минутный watchdog. Shell trap не единственная защита от SIGKILL.
+
+Ошибка сохраняет прежний рабочий сертификат и безопасную причину; проверьте
+status/timer, DNS, маршрут бота, firewall/NAT. После завершения аренды HTTP-маршрут
+может исчезнуть и renew не пройдёт. Ранее выпущенный сертификат не отзывается.
+Логи не должны содержать account/challenge/private key.
+
+## Обновление и recovery
+
+```bash
+sudo transitclient update --package-url "$REAL_RELEASE_HTTPS_URL" \
+  --version "$RELEASE_VERSION" --sha256 "$TRUSTED_RELEASE_SHA256"
+```
+
+Нужны реальный HTTPS URL, версия и доверенный SHA256 этого проекта. Latest и
+upstream self-update отсутствуют. URL/хеш сохраняются после успешной проверки.
+До исполнения проверяется архив: запрещены traversal, symlink/hardlink/device
+и слишком большой размер. Обновление сохраняет account/config/certs/site.
+
+Журнал/snapshot Compose/Caddy появляются до переименований. Ошибка возвращает
+прежний пакет/образ; пакет остаётся `/opt/tenant-selfsteal.previous-<id>`.
+Recovery с runtime helpers сохраняется отдельно в state и доступен при
+временном отсутствии runtime в `/opt`. При незавершённой операции сначала
+сверяйте status/журнал, затем штатный recovery:
+
+```bash
+sudo python3 /var/lib/tenant-selfsteal/recover.py _recover
+```
+
+Не удаляйте transaction markers и поколения до восстановления. Backup
+account/config/key содержит секреты: храните закрыто, не добавляйте в release/Git.
+
+## Удаление
+
+`uninstall` показывает последствия, требует `да`, останавливает свои units/
+Compose-проект и удаляет launcher/temporary rules только по владению.
+Docker/system packages/VPN/чужие контейнеры/сети остаются. Config/certs/account
+сохраняются root-only в `/var/lib/tenant-selfsteal-backup-<time>`, runtime
+остаётся в `/opt`. Удаляйте backup вручную после проверки необходимости ключей.
+
+## Отдельная staging-приёмка
+
+Реальные операции и выпуск не входят в локальные тесты. Только на отдельно
+разрешённом стенде, для новой установки:
+
+```bash
+sudo bash ./selfsteal.sh install \
+  --staging-ca-file /secure/letsencrypt-staging-roots.pem
+```
+
+Trust bundle получите из [официальной staging-документации](https://letsencrypt.org/docs/staging-environment/).
+Root-only копия остаётся в state; системный trust не меняется. STAGING помечен,
+production-доверия нет. Смена CA существующей identity не автоматизирована.
+Production требует отдельного разрешения и учёта
+[лимитов CA](https://letsencrypt.org/docs/rate-limits/).
+
+Внешняя матрица ещё не подтверждена: Ubuntu 22.04/24.04/26.04 amd64/arm64,
+чистый сервер/существующие web servers, host/bridge VPN, IPv4/IPv6, занятый 8080,
+Docker NAT без proxy, firewall/NAT, HTTP self-test, staging renewal через timer,
+CA error/timeout, SIGTERM/SIGKILL/reboot, failed reload/update и сохранение
+SSH/чужих ресурсов. Моки не заменяют серверную приёмку.

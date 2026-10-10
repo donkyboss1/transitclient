@@ -1,0 +1,760 @@
+{
+  "source": {
+    "repository": "DigneZzZ/remnawave-scripts",
+    "commit": "24134e23a438217cd52373ecdb0fcf7983e0e72c"
+  },
+  "templates": [
+    {
+      "id": "1",
+      "folder": "10gag",
+      "name": "😂 10gag — мемы",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 17318,
+          "sha256": "be23a541658869d39a548d7f3c79d8e7098f550404cbf3792907a57cd3f9c3ee"
+        },
+        {
+          "path": "assets/script.js",
+          "size": 176423,
+          "sha256": "ed094f3f9f09747674e089f2d3dbddc4d1e71f4a0c556d504200c109cbaf27a8"
+        },
+        {
+          "path": "assets/style.css",
+          "size": 15999,
+          "sha256": "54fd1856dd361eee2fd6e9e30f2ca4365225801cae6f59914963f149ea477243"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 7107,
+          "sha256": "17704b3b6cfa3733d044ef94fb88c204a862f5167a439d7eb17379a6da77e6bc"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "3c1d08d4bcf9c49500459e1bae75c4acda86892b7a5073404857711065e62e7d"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 72835,
+          "sha256": "68aad07119c064716f8955a8c88a1a8765142f63cfb6b14209c15cce8d4e7163"
+        },
+        {
+          "path": "index.html",
+          "size": 822,
+          "sha256": "53d3b5d3986afce307b852149fd2f25848d8fc5c5f5160a4b8ec2957271ff231"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 19157,
+          "sha256": "401625f4ebd08955e6bfd3e500e148455312408b1a0891b3d4d43118066e9be5"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 91551,
+          "sha256": "379e22176e33c1ac52d352f185e14d3be556f320988c829ceef7e2c12745e3fd"
+        }
+      ]
+    },
+    {
+      "id": "2",
+      "folder": "convertit",
+      "name": "📁 Convertit — конвертер файлов",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 7814,
+          "sha256": "56e36c463cc05ab27145a8372e225f1f29caa545dcae50ec5cfa3fe5e3bbc78f"
+        },
+        {
+          "path": "assets/pexels-photo-2608517.jpeg",
+          "size": 1157921,
+          "sha256": "06011c4e34554523d164456bb19db882ade9b926b4890b696a0abdf164533aa4"
+        },
+        {
+          "path": "assets/pexels-photo-3062541.jpeg",
+          "size": 65586,
+          "sha256": "8c279883f1f0d6a0a57632cd7419fa80e67fdee409a2e2d85e528d2b4a2ba24b"
+        },
+        {
+          "path": "assets/pexels-photo-3379943.jpeg",
+          "size": 54544,
+          "sha256": "2c9b5ee61901be92caa4b4b213020effdce4eb0ce6816e7b5e2613dc77214623"
+        },
+        {
+          "path": "assets/pexels-photo-4144923.jpeg",
+          "size": 258661,
+          "sha256": "b3be415c22f74b11000b1bf6c67e6bd8d0cd89a30e11ba9f7c649241eac57471"
+        },
+        {
+          "path": "assets/script.js",
+          "size": 286896,
+          "sha256": "130ab3f30c652110f0d4e98595764bce1726d41568ae7307c7092c2c12aa6e81"
+        },
+        {
+          "path": "assets/style.css",
+          "size": 22577,
+          "sha256": "1063c9ea9be0a04a7a9c615d965099fe15461a88447e8fe59f2b1d2007a9da69"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 3898,
+          "sha256": "3b029d8ed40a7b043d6a03fc6bdcef8d95380b02330171e7d6114f3ebbbc642d"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "154cab9ab688239896c3c2ce4ed3eefa9cc660043e937801f4cafe65a5206262"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 36159,
+          "sha256": "e8ef537a952bb530b2f2d1425ebdfe9e81138d36b0ba06c907acfb702fd41173"
+        },
+        {
+          "path": "index.html",
+          "size": 905,
+          "sha256": "108ae37d9d28d4abd2cf18dd98604c25e0800eb785003a13ab6246e2b1d60644"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 8491,
+          "sha256": "fd6733f23e7ed39ed20af61b575c854c84037d45f00c8ae359d3589527db2b1a"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 27315,
+          "sha256": "0a1e67f8b6bdb8c2e05f592c1c6e439f6d78a77bdfa7a76a5d436652e3049af8"
+        }
+      ]
+    },
+    {
+      "id": "3",
+      "folder": "converter",
+      "name": "🎬 Converter — видеоконвертер",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 16016,
+          "sha256": "ffd32fe2e0d658dfd4868717e92d4696c8161aa9be9fa3cb6aa5895210b93ea8"
+        },
+        {
+          "path": "assets/script.js",
+          "size": 245270,
+          "sha256": "66dc2f54a2e872ffc42a4ac6b6f02ff1dcc7fe66dda59723e902ec52dd977c8c"
+        },
+        {
+          "path": "assets/style.css",
+          "size": 26323,
+          "sha256": "a3a21523e1f203cc1ae5ce6f0a3d0fa1e948bce473a4595a92e6d5c9ae42d0f9"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 8202,
+          "sha256": "5d02c235b21c73f42be507513a6b853b7b9214e9690479a5240b75e46af2751e"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "5e81130c92ec59924c2ccbb5f4cbcc319eb2088242082393cccc906ee0d9f1c3"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 43223,
+          "sha256": "195f00a73e9585e088fd6006ea735e1e51110d54736f7776847aa350d90f5985"
+        },
+        {
+          "path": "index.html",
+          "size": 737,
+          "sha256": "a2205d40f00b57f8be0ede5c63f984ccf24eb4331a43d39e90f0651d4fe29f87"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 17772,
+          "sha256": "e3a3da4a302494ff39e1a6588c82aba7f641b26e1021ac53a4aa1650a6d02df2"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 46104,
+          "sha256": "48e3cdff55d4c629ee90780f757344ae7bedcb1a51bce46da373f3a6dbe1de10"
+        }
+      ]
+    },
+    {
+      "id": "4",
+      "folder": "downloader",
+      "name": "⬇️ Downloader",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 11413,
+          "sha256": "69c47eaed9ff20d839926b82ada3724d95513acf75ea543d6f957ef886a1da7e"
+        },
+        {
+          "path": "assets/v1/js.js",
+          "size": 234451,
+          "sha256": "b00e8ca050dd2050180b4696a95caf12028272d98f876ac43aa5a50572c204f5"
+        },
+        {
+          "path": "assets/v1/style.css",
+          "size": 18786,
+          "sha256": "87440fcf120c6c2da021e8ce4f048374702326469f69d3d74dcea5f385d20054"
+        },
+        {
+          "path": "assets/v2/js.js",
+          "size": 235438,
+          "sha256": "e837efe975bdd16e2f14bdc27a13db4854940974cbce36b3d0207ca623be8637"
+        },
+        {
+          "path": "assets/v2/style.css",
+          "size": 18792,
+          "sha256": "5564f54a91f056976e96710370a49d9985f81c89e1ecca91423844576abb2464"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 4005,
+          "sha256": "c39a8953d748d136697e1283aa6279c807fab39c6c2c441ceef26d2a171b908d"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "dfd2571d6284ffa8189cd15d459d3a0a9be09b3ffcdf0e2d054bc618257c9147"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 158986,
+          "sha256": "337f09fd0f0ab9e9fb0024610d1251025e3e49e24c1350de2422a27bae3df11d"
+        },
+        {
+          "path": "index.html",
+          "size": 969,
+          "sha256": "5f86ef88e4f12dcbe518ff0852938c58024e3ef0e547bfac8fdef43709eac623"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 460,
+          "sha256": "56aa0a4ae7070f88086bc52d2ebb0892b498eabacc23ecf20f20ba7ca07c77e3"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 10914,
+          "sha256": "e5ab007fcbd16863887064d1988fe16e6414e850d3353aafea8d60dd995384ca"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 85694,
+          "sha256": "2016c58fc5eef7780bc9b65a62cf84a2f954f2d8d74b48a3b289af0d76d44d45"
+        }
+      ]
+    },
+    {
+      "id": "5",
+      "folder": "filecloud",
+      "name": "☁️ FileCloud",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 28193,
+          "sha256": "0ace30126cccb7b75e3c2057eee15d8b99a53c9c09dcd522d338e1b69bdb0528"
+        },
+        {
+          "path": "assets/v1/script.js",
+          "size": 477187,
+          "sha256": "cb1980a9b7353d5624e1800c593f038d0fa4ac7332c577b450635d89087ccc24"
+        },
+        {
+          "path": "assets/v1/style.css",
+          "size": 14969,
+          "sha256": "aa6664fb7339dfae9825815aa4009d3ab4315ad8b91f71ccdbb659af20b533c8"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 10960,
+          "sha256": "8e14b8527427f4cb2b421ad6ff77346d8065d275c23421223e88c6cac7841075"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "96a11e4a201512a88616215e51c2ebbc20ef97b7c2f4b5571ebd0b790d0fb823"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 110779,
+          "sha256": "df6cf4e2fb6a04da9ba53f9ccf1378f7d77459bb3cfd4c73e219b0fbe1e3cce4"
+        },
+        {
+          "path": "index.html",
+          "size": 1022,
+          "sha256": "3ea45fb7a987e00c70c003e7b95bed6d80e98267419e14420555aa933f6b31f5"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 31728,
+          "sha256": "9f9f1485644b178e51f75c6436ce963bcace5e73c31ec2b1d0577312483a6367"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 144274,
+          "sha256": "a97c506d64f44a2128d7f8859210c02c11dae6d865a420a8950f33a1d65e8376"
+        }
+      ]
+    },
+    {
+      "id": "6",
+      "folder": "games-site",
+      "name": "🎮 Игровой портал",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 14774,
+          "sha256": "fce2963e1a354dcf48c9f26ab7e69b26c4711e6af498bc7668f0ee2717fd77e2"
+        },
+        {
+          "path": "assets/images/avatar_1.jpg",
+          "size": 19889,
+          "sha256": "fe816b9a8a8af4bcbe522dbb78ab124ab4b00d866ba30d18d71502f0bfd566d4"
+        },
+        {
+          "path": "assets/images/bg_1.jpg",
+          "size": 297078,
+          "sha256": "ccbb56e70f2bf4912748df294b217e4a4aa71d7ff21051217e48259e426a611e"
+        },
+        {
+          "path": "assets/images/bg_2.jpg",
+          "size": 119037,
+          "sha256": "97cd42d418383b496f0bb781a82c21787eab015f7e795f3f8e2c9df8062fe957"
+        },
+        {
+          "path": "assets/images/bg_3.jpg",
+          "size": 123524,
+          "sha256": "78a6c33f07ff558c3bbe02d1f6bcade79faa089f7fd289fb246e2fe6bc30d06a"
+        },
+        {
+          "path": "assets/images/bg_4.jpg",
+          "size": 103433,
+          "sha256": "304cd29c3d3e87c4e782ba2b98a9b02c579eb9b7390421fbe44efd4f052b442e"
+        },
+        {
+          "path": "assets/images/image_1.jpg",
+          "size": 61327,
+          "sha256": "d21e3f1413cc73e2dba19a0e085c0efd2bd6655a7e01dce6563df099b563c10c"
+        },
+        {
+          "path": "assets/images/image_10.jpg",
+          "size": 63291,
+          "sha256": "ccf5be60c8fd0f7b8c9265a568d4f68cf4fb8d2fa708e4f0cf713bd606941183"
+        },
+        {
+          "path": "assets/images/image_11.jpg",
+          "size": 62533,
+          "sha256": "4b0afec6bd75db86028899e3d6009ec29bfb6bb0d3f40e10f2b977d94c28f829"
+        },
+        {
+          "path": "assets/images/image_12.jpg",
+          "size": 63515,
+          "sha256": "6b410f80e36ceee8f337571ccdc0ec6f3b6e6ee1e8f029237bc6f52c4b89305e"
+        },
+        {
+          "path": "assets/images/image_13.jpg",
+          "size": 61157,
+          "sha256": "3af547c18156dadf0ccaae8f16955664ed6ccf9b4c7f2e62e9aafc4610814417"
+        },
+        {
+          "path": "assets/images/image_14.jpg",
+          "size": 65523,
+          "sha256": "515f019e7c311d0ba3bbee842b1dcecff97afb4ad187c44d3cd672a624c4fec9"
+        },
+        {
+          "path": "assets/images/image_15.jpg",
+          "size": 59230,
+          "sha256": "bcead7b099426cea63ef756b10f64e25edb631c8152156d1b7809afafc50b0bb"
+        },
+        {
+          "path": "assets/images/image_16.jpg",
+          "size": 59998,
+          "sha256": "96da896a28679fd4b6e3a199491061500bf1e869b535476234ebd90205d2bb32"
+        },
+        {
+          "path": "assets/images/image_17.jpg",
+          "size": 64608,
+          "sha256": "8b1e06441aaadd6c32059d6d30ae78852c76531954068e3000c2704e347cbf65"
+        },
+        {
+          "path": "assets/images/image_18.jpg",
+          "size": 67485,
+          "sha256": "51d5d49e36adfcb6778874135eacf9347bdf97a81c095fb7ed975d53dada31c4"
+        },
+        {
+          "path": "assets/images/image_19.jpg",
+          "size": 65945,
+          "sha256": "da1a4b007c17265984f596960ffba2cfdc360336b43b2f3be56fd92299fe76c0"
+        },
+        {
+          "path": "assets/images/image_2.jpg",
+          "size": 59813,
+          "sha256": "c768e997fb557a64c819fa2117795efba2a4a34ca3ca99adcb9829fc8e470838"
+        },
+        {
+          "path": "assets/images/image_20.jpg",
+          "size": 77713,
+          "sha256": "b0e41f24fbcb70027a33da2e47a8bae106bf594f3b3404fd26407de973ce8409"
+        },
+        {
+          "path": "assets/images/image_3.jpg",
+          "size": 67697,
+          "sha256": "c4740234848119ea2a553f745800cab4815c35d79078112ce040d9b8a7d6616d"
+        },
+        {
+          "path": "assets/images/image_4.jpg",
+          "size": 63194,
+          "sha256": "d04ea88be75809e512225416e0a1b4530157588ae72ca4ccc6c8ffe9b478fdd2"
+        },
+        {
+          "path": "assets/images/image_5.jpg",
+          "size": 71096,
+          "sha256": "1da8a4dbdf5c4262343f792b206fda7bc34faf30455394e8d4c9ac27d8b17e1b"
+        },
+        {
+          "path": "assets/images/image_6.jpg",
+          "size": 20806,
+          "sha256": "ff359e7c5c5d4efb8d69e11f906b0fadabf6819d2824962c607c46450782503a"
+        },
+        {
+          "path": "assets/images/image_7.jpg",
+          "size": 72199,
+          "sha256": "040ed1eb084c71fc5d4667c6a1f78af289a6c1378c4305c2f62530019d5e1fad"
+        },
+        {
+          "path": "assets/images/image_8.jpg",
+          "size": 63733,
+          "sha256": "c22078dcae73ce1e811851452b78a52520ff961a8eec2170a1cc7054abf2e71a"
+        },
+        {
+          "path": "assets/images/image_9.jpg",
+          "size": 60144,
+          "sha256": "dac9a051e7142e9e474db154891a73407d5a510f84ddc35845eea0a0b29d9a31"
+        },
+        {
+          "path": "assets/images/no-avatar.jpg",
+          "size": 6782,
+          "sha256": "f9ea133669912a688ef4d02ae193d5fbe0bfde26ade07b7baf9829b309c7565e"
+        },
+        {
+          "path": "assets/script.js",
+          "size": 272204,
+          "sha256": "f9049540b184e18fe774739a5b2d75dfa89bb4cb9d9b2d7c2bf4cd6aa9b2d8f7"
+        },
+        {
+          "path": "assets/style.css",
+          "size": 33384,
+          "sha256": "9db2bd6f1e199f2a7dc5faadef60e9843c3cdea53278b2655e81304e5bba4cad"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 7115,
+          "sha256": "df888cd58156ad1a90b2666392f68c23d1c12a67767f319adf1d319ffcc5c1f6"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "e2ae68996c72e3834f8739e9addd7ff983b3f9db7a6c35ff40fa3b67f3d9f63d"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 19018,
+          "sha256": "3691fc25d6401f1bfa2d2861669bc01ac0e3793fe00fd4c0a1d7b2cf704539c9"
+        },
+        {
+          "path": "index.html",
+          "size": 1003,
+          "sha256": "6737b2135e0a7c09c06d921bb5b00ae4be71660bb170dad2499a62eba9f0e3d2"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 14724,
+          "sha256": "f2dadb8d7451e7a5bea399c90078ede9c278a0aa882b034862cc00488e543440"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 66304,
+          "sha256": "627a9521e42ac833dd44d33fb390bbd5856ea6b13b9d6f769d7668a953f68172"
+        }
+      ]
+    },
+    {
+      "id": "7",
+      "folder": "modmanager",
+      "name": "🛠️ ModManager",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 40925,
+          "sha256": "7eadab759c3479631d808fe9972473716a76bb1d14eb667f604e3fa331e04472"
+        },
+        {
+          "path": "assets/index-16g14u43.js",
+          "size": 371011,
+          "sha256": "3b9444b68fae60d614439d1c0b56c5c08315c7e710d061eaa01be9b4cb3af68e"
+        },
+        {
+          "path": "assets/index-CKIolJbu.css",
+          "size": 35174,
+          "sha256": "f558197a6ff2a582fe847f99ef67564910c19b613e3ea624619bd6cddc3bfee6"
+        },
+        {
+          "path": "assets/pexels-photo-1222271.webp",
+          "size": 2814,
+          "sha256": "fd468ae6aa3b0d53c82af3c9a54857ef4633a84b77f36c71d6d8b579274691fd"
+        },
+        {
+          "path": "assets/pexels-photo-1239291.webp",
+          "size": 4356,
+          "sha256": "9477ce00e69eff86f3fec428aa20d6f284d5b0c790faa8bdef1f5cebb05efa5f"
+        },
+        {
+          "path": "assets/pexels-photo-1516680.webp",
+          "size": 5940,
+          "sha256": "8c2cbf792a36df293c460cc2c6e96a37a1465877c2eba0d214977c11519f20cd"
+        },
+        {
+          "path": "assets/pexels-photo-1681010.webp",
+          "size": 6630,
+          "sha256": "bb5c7959f61aee79cb8e12b0497f65909a6c3a477e53d8d10cf4ca7071b5e58b"
+        },
+        {
+          "path": "assets/pexels-photo-2379004.webp",
+          "size": 6414,
+          "sha256": "dcebeebd3ed89cbee582c8aef20c584230a0d461df30c96db3bbb800a61594fa"
+        },
+        {
+          "path": "assets/pexels-photo-774909.jpeg",
+          "size": 8745,
+          "sha256": "8549e209d95115bd2b0391dc03ff1d7539cc9dcc000a06b09dbb9479af8fc9b3"
+        },
+        {
+          "path": "assets/pexels-photo-7915357.jpg",
+          "size": 117841,
+          "sha256": "6d303c11c7398ce164fdcd5f23f521bf4fcac47bd989b3f5476274a24877ab84"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 14160,
+          "sha256": "961f9a2eef883b9aac4e78606f767f485ec73b377abb754725770183bc5db8ca"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "ed2e7a443286c53e00f020913f0c90fc7d46e3392e267acabd6a743181a6d007"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 260474,
+          "sha256": "19ebe76c705afabb9acaeacc172c0edb4416782275e0e67d4a78f7d23adf4303"
+        },
+        {
+          "path": "index.html",
+          "size": 1865,
+          "sha256": "71a592287e9a2fb577134abeed004a35274b5d4209df0adaac14ce322b881ab1"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 45562,
+          "sha256": "20793a75e9c1da69c94037ca3070754f78bcf2ad57a12ae12811a8bd7fc9ef22"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 224385,
+          "sha256": "155429940089e6bd14f849467a6f22a87b2819f7649d5047808e06becc55935f"
+        }
+      ]
+    },
+    {
+      "id": "8",
+      "folder": "speedtest",
+      "name": "🚀 SpeedTest",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 7914,
+          "sha256": "c7d106900a0186a6cb686dcba986dc439f014d2aade9f804f6e8d9222877a057"
+        },
+        {
+          "path": "assets/script.js",
+          "size": 155652,
+          "sha256": "5fc33318698e30cb44529b69f0eed3e913f0387effd4bb95ca1f852159c831a6"
+        },
+        {
+          "path": "assets/style.css",
+          "size": 11776,
+          "sha256": "a8ce350d21ce7a0fa59faadf9a16b49c46c8642f118def82a057fbf56b8bef08"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 3858,
+          "sha256": "5c766a3fd6f9c56a7983df4dc7647e5b34631acd1379031fffa4d5d55cd5e399"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "1504c881d88afaf1585ac3d0f340fa78c99460223092cd4f564dd29b3b8054e9"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 20071,
+          "sha256": "85d0952d438945fe0a0cf7eb8a3f982525cd4dc76fd11690a5a33e05b0ed478e"
+        },
+        {
+          "path": "index.html",
+          "size": 839,
+          "sha256": "1255b167c7d5c52eb2b6663d1bc8833ec739b9bf5d4a7799ecea812c41c83d82"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 8604,
+          "sha256": "473301dcf6fd0623f6cfae5084729df580a847855b412139876354d9f0455693"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 24227,
+          "sha256": "213b143e7cadc81ce0e0c8242066658bc625fd16d0f0de744eecdf5878e3ed74"
+        }
+      ]
+    },
+    {
+      "id": "9",
+      "folder": "YouTube",
+      "name": "📺 YouTube",
+      "files": [
+        {
+          "path": "apple-touch-icon.png",
+          "size": 13352,
+          "sha256": "b275951b7db207f0b37f2e61d6825457fed1afe800e5c715123aecbbdaa4e93b"
+        },
+        {
+          "path": "assets/v1/script.js",
+          "size": 179497,
+          "sha256": "45f4c03294c31cb57ecf37799d7dbeaa5dfcdef2406a7808f9a32d6d3c661494"
+        },
+        {
+          "path": "assets/v1/style.css",
+          "size": 25341,
+          "sha256": "5d678452387781f4038745163509bf13dba9317ff9e6aeadf6af915789bc536e"
+        },
+        {
+          "path": "favicon-96x96.png",
+          "size": 6428,
+          "sha256": "5a2f5f313b3e2878926840f7e87d6b26710229638735e33f679091793dca7d3d"
+        },
+        {
+          "path": "favicon.ico",
+          "size": 15086,
+          "sha256": "415733058a7a922c61fc0f782224cb827d4cdfd3f0d18feb871f91b0c2ec9af9"
+        },
+        {
+          "path": "favicon.svg",
+          "size": 58047,
+          "sha256": "6a17d73e13172142e6d2ea93dc33da202e51496e25a06a589e363d451605e144"
+        },
+        {
+          "path": "index.html",
+          "size": 1100,
+          "sha256": "00305dd32f9851344552b2a9b1ea8fb45fa0533550937a1d13b9ea9335a2ad5e"
+        },
+        {
+          "path": "site.webmanifest",
+          "size": 436,
+          "sha256": "91a78d4fe16316df93ec91b33a15c7ed84aab2b0de8a9959da40f108dfc2154e"
+        },
+        {
+          "path": "web-app-manifest-192x192.png",
+          "size": 14626,
+          "sha256": "c56a4d2b439823e35d689a5ce4fc4c2e56efb022d996e07d5c0e77bdccdb5927"
+        },
+        {
+          "path": "web-app-manifest-512x512.png",
+          "size": 43631,
+          "sha256": "552038bda05c12a0281c54defe897e071a8be518563d0d660d723cc639580818"
+        }
+      ]
+    },
+    {
+      "id": "10",
+      "folder": "503-1",
+      "name": "⚠️ Страница 503 — вариант 1",
+      "files": [
+        {
+          "path": "assets/main.js",
+          "size": 148672,
+          "sha256": "e3124a8ce1948f3a0f511d0dfd16a1bd06acf567209256ba0cd63b10d7161b80"
+        },
+        {
+          "path": "assets/style.css",
+          "size": 7738,
+          "sha256": "5a84e4494b7ad7dc726b79ddd54ab6e700899d848d7a06720ac3077cbafe2396"
+        },
+        {
+          "path": "index.html",
+          "size": 478,
+          "sha256": "5d185626d968d4c5192b32eeb577179cffd314ffe46f7cd72fd37fb5f6857852"
+        }
+      ]
+    },
+    {
+      "id": "11",
+      "folder": "503-2",
+      "name": "⚠️ Страница 503 — вариант 2",
+      "files": [
+        {
+          "path": "assets/main.js",
+          "size": 151953,
+          "sha256": "c77a8f2f1f63f9aad272813693c602b6b318bacc34d505e95e64557baa01f1a9"
+        },
+        {
+          "path": "assets/style.css",
+          "size": 11641,
+          "sha256": "15de0b2f594f0663bfc0eaa2b19f1e64c9d8d11d2efbd48ccd01a8c258accf7a"
+        },
+        {
+          "path": "index.html",
+          "size": 487,
+          "sha256": "60fe9239a7af0489dea9aed7ae56e3ef146672ebd6b1b174b94ed8d9b7525073"
+        }
+      ]
+    }
+  ]
+}

@@ -6,9 +6,9 @@ set -euo pipefail
 umask 077
 
 # Publication fills these three values together. Never guess a repository URL.
-RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.2.0.tar.gz'
-RELEASE_VERSION='1.2.0'
-RELEASE_SHA256='789056d3a4025db7f02bf3a09ea7d5462d3adfa10db36383d4c05b941e766e8c'
+RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.2.1.tar.gz'
+RELEASE_VERSION='1.2.1'
+RELEASE_SHA256='2150b03b72ee9e67ea030374e739bce291ce1c0ac287b95abaef520695406cb8'
 
 fail() { printf '\n❌ %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -39,6 +39,15 @@ while (($#)); do
         *) break ;;
     esac
 done
+
+# sudo can give a piped Bash a separate PTY whose input is not forwarded.
+# Fail before the controller waits on /dev/tty; use a downloaded file instead.
+if [[ ! -t 0 && -n "${SUDO_COMMAND:-}" ]]; then
+    case "${1:-menu}" in
+        menu|install|configure|template|update|uninstall)
+            fail 'Интерактивный запуск через pipe + sudo не поддерживается. Скачайте install.sh в файл и запустите sudo bash ./install.sh install; от root запускайте bash без sudo.' ;;
+    esac
+fi
 
 command -v python3 >/dev/null 2>&1 || fail 'Нужен Python ≥3.10. На Ubuntu сначала выполните sudo apt-get update && sudo apt-get install python3, затем повторите запуск.'
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || fail 'Нужен Python ≥3.10; существующий Python не заменён.'

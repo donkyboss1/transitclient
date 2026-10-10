@@ -40,6 +40,15 @@ while (($#)); do
     esac
 done
 
+# sudo can give a piped Bash a separate PTY whose input is not forwarded.
+# Fail before the controller waits on /dev/tty; use a downloaded file instead.
+if [[ ! -t 0 && -n "${SUDO_COMMAND:-}" ]]; then
+    case "${1:-menu}" in
+        menu|install|configure|template|update|uninstall)
+            fail 'Интерактивный запуск через pipe + sudo не поддерживается. Скачайте install.sh в файл и запустите sudo bash ./install.sh install; от root запускайте bash без sudo.' ;;
+    esac
+fi
+
 command -v python3 >/dev/null 2>&1 || fail 'Нужен Python ≥3.10. На Ubuntu сначала выполните sudo apt-get update && sudo apt-get install python3, затем повторите запуск.'
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || fail 'Нужен Python ≥3.10; существующий Python не заменён.'
 

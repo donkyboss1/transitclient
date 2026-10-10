@@ -241,3 +241,15 @@ def test_actual_bash_stdin_without_public_metadata_stops_cleanly(bash, tmp_path)
     assert b'--package-url' in result.stderr
     assert b'unbound variable' not in result.stderr
     assert not list(temp.iterdir())
+
+
+@pytest.mark.parametrize('command', ['install', 'menu', 'configure', 'template', 'update', 'uninstall'])
+def test_sudo_pipe_interactive_command_fails_before_prompt_or_download(bash, tmp_path, command):
+    binary, environment, temp = shell_environment(tmp_path)
+    environment['SUDO_COMMAND'] = '/usr/bin/bash -s -- ' + command
+    result = subprocess.run([bash, '-c', 'export PATH="$1:$PATH"; exec bash -s -- "$2"',
+                             'transitclient-test', bash_path(binary), command],
+                            env=environment, input=SCRIPT.encode(), capture_output=True, timeout=5)
+    assert result.returncode == 1
+    assert 'pipe + sudo'.encode() in result.stderr
+    assert not list(temp.iterdir())

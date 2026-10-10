@@ -7,11 +7,13 @@
 ## Установка
 
 ```bash
-curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/donkyboss1/transitclient/main/install.sh | sudo bash -s -- install
+bash -c 'set -e; installer=$(mktemp); trap "rm -f -- \"$installer\"" EXIT; curl -fsSL --proto "=https" --proto-redir "=https" https://raw.githubusercontent.com/donkyboss1/transitclient/main/install.sh -o "$installer"; if [ "$EUID" -eq 0 ]; then bash "$installer" install; else sudo bash "$installer" install; fi'
 ```
 
 Мастер проверит сервер, предложит настройки и покажет план перед установкой.
 Существующие сайты, службы и чужие контейнеры автоматически не меняются.
+Команда сначала сохраняет скрипт во временный файл, чтобы меню и Ctrl+C
+работали в обычном SSH-терминале.
 
 ## Что понадобится
 

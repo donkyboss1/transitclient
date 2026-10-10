@@ -135,6 +135,8 @@ def safe_extract(archive_path, destination, version, digest):
         raise ValueError('Каталог распаковки уже существует.')
     required = {'selfsteal.sh', 'selfsteal.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'templates.json', 'docs/integration.md', 'dependencies.json', 'VERSION',
                 'LICENSE', 'NOTICE.md', 'vendor/acme.sh', 'site/index.html'}
+    if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 4, 0):
+        required.update({'client_panel.py', 'terminal_ui.py'})
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0
         for entry in archive:

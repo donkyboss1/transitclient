@@ -941,6 +941,173 @@ def test_saved_own_package_is_reusable_but_changed_controller_is_not(app, config
         app.check_install_resources()
 
 
+def test_ctrl_c_during_reconfiguration_rolls_back_before_propagating(app, config, monkeypatch):
+    config.update(vpn_port=443)
+    app.render_caddy(config)
+    app.atomic_json(app.CONFIG, config)
+    original = {name: (app.STATE / name).read_bytes() for name in ('Caddyfile', 'compose.yaml')}
+    current = app.STATE / 'certs/current'
+    current.mkdir(parents=True)
+    (current / 'fullchain.pem').write_bytes(b'CERT')
+    (current / 'key.pem').write_bytes(b'KEY')
+    answers = iter(['9543', 'да'])
+    monkeypatch.setattr('builtins.input', lambda *_: next(answers))
+    monkeypatch.setattr(app, 'free_port', lambda *_: True)
+    interrupted = [False]
+    def compose(*args, **kwargs):
+        if args[0] == 'run' and not interrupted[0]:
+            interrupted[0] = True
+            raise KeyboardInterrupt
+        return result()
+    monkeypatch.setattr(app, 'compose', compose)
+    monkeypatch.setattr(app, 'validate_certificate', lambda *_: b'DER')
+    monkeypatch.setattr(app, 'verify_served', lambda *_: None)
+    with pytest.raises(KeyboardInterrupt):
+        app.configure(config, '3')
+    assert app.read_json(app.CONFIG)['local_port'] == 9443
+    assert {name: (app.STATE / name).read_bytes() for name in original} == original
+    assert not (app.STATE / 'configuration-transaction.json').exists()
+
+
+@pytest.mark.parametrize('interruption', [KeyboardInterrupt, EOFError])
+def test_http_test_cleans_owned_probe_before_interrupt(app, config, monkeypatch, interruption):
+    from contextlib import nullcontext
+    monkeypatch.setattr(app, 'check_dns', lambda _: None)
+    monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
+    monkeypatch.setattr(app, 'confirm', lambda _: True)
+    monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
+    events = []
+    monkeypatch.setattr(app, 'open_firewall', lambda _: events.append('open'))
+    monkeypatch.setattr(app, 'run', lambda *a, **k: events.append('launch') or result())
+    monkeypatch.setattr(app, 'stop_probe', lambda: events.append('stop-owned'))
+    class Response:
+        def read(self, *_):
+            raise interruption
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            return nullcontext(Response())
+    monkeypatch.setattr(app.urllib.request, 'build_opener', lambda *_: Opener())
+    with pytest.raises(interruption):
+        app.http_self_test(config)
+    assert events == ['open', 'launch', 'stop-owned']
+
+
+def test_renew_interrupt_aborts_acme_and_does_not_apply_certificate(app, config, monkeypatch):
+    events = []
+    monkeypatch.setattr(app, 'check_dns', lambda _: None)
+    monkeypatch.setattr(app, 'synchronize_acme_parameters', lambda *_: None)
+    monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
+    monkeypatch.setattr(app, 'acme_command', lambda *_: ['fake-acme'])
+    monkeypatch.setattr(app, 'apply_certificate', lambda *_: pytest.fail('Cancelled renew must stop'))
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(app, 'run', interrupt)
+    monkeypatch.setattr(app, 'abort_acme', lambda: events.append('abort'))
+    with pytest.raises(KeyboardInterrupt):
+        app.renew(config)
+    assert events == ['abort']
+
+
+@pytest.mark.parametrize('success', [True, False])
+def test_explicit_local_tls_check_records_only_verified_current_identity(app, config, monkeypatch, success):
+    import client_panel
+    current = app.STATE / 'certs/current'
+    current.mkdir(parents=True)
+    (current / 'fullchain.pem').write_bytes(b'CERT')
+    monkeypatch.setattr(app, 'validate_certificate', lambda *_: b'DER')
+    def verify(candidate, expected, attempts):
+        assert candidate == config and expected == b'DER' and attempts == 1
+        if not success:
+            raise app.Failure('HTTPS не подтверждён')
+    monkeypatch.setattr(app, 'verify_served', verify)
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: pytest.fail('TLS check is not a full inventory'))
+    if success:
+        app.local_self_test(config)
+    else:
+        with pytest.raises(app.Failure):
+            app.local_self_test(config)
+    assert app._menu_tls_check['success'] == success
+    assert app._menu_tls_check['identity'] == client_panel.tls_identity(app, config)
+
+
+def test_perform_eof_propagates_without_error_history(app, config, monkeypatch):
+    app.atomic_json(app.CONFIG, config)
+    def dispatch(_):
+        raise EOFError
+    monkeypatch.setattr(app, 'dispatch', dispatch)
+    with pytest.raises(EOFError):
+        app.perform(SimpleNamespace(command='configure'))
+    assert not (app.STATE / 'result.json').exists()
+
+
+def test_declined_action_has_no_failure_history(app, config, monkeypatch, capsys):
+    app.atomic_json(app.CONFIG, config)
+    def dispatch(_):
+        raise app.Failure('Установка отменена', 'CANCELLED')
+    monkeypatch.setattr(app, 'dispatch', dispatch)
+    assert app.perform(SimpleNamespace(command='install', _menu_mode=True)) == 0
+    assert not (app.STATE / 'result.json').exists()
+    output = capsys.readouterr()
+    assert 'Действие отменено' in output.out and output.err == ''
+
+
+def test_cli_decline_retains_nonzero_exit_code(app, monkeypatch):
+    def dispatch(_):
+        raise app.Failure('Отмена', 'CANCELLED')
+    monkeypatch.setattr(app, 'dispatch', dispatch)
+    assert app.perform(SimpleNamespace(command='install')) == 1
+
+
+def test_declining_uninstall_is_a_cancellation_before_mutations(app, monkeypatch):
+    monkeypatch.setattr('builtins.input', lambda _: '')
+    monkeypatch.setattr(app, 'check_install_resources', lambda: pytest.fail('No mutations on decline'))
+    with pytest.raises(app.Failure) as error:
+        app.uninstall()
+    assert error.value.code == 'CANCELLED'
+
+
+def test_setting_confirmation_shows_old_and_new_before_decline(app, config, monkeypatch, capsys):
+    app.atomic_json(app.CONFIG, config)
+    before = app.CONFIG.read_bytes()
+    answers = iter(['8091', 'нет'])
+    monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
+    def read(prompt):
+        if '[да/нет]' in prompt:
+            assert 'HTTP-порт: 8080 → 8091' in capsys.readouterr().out
+        return next(answers)
+    monkeypatch.setattr('builtins.input', read)
+    with pytest.raises(app.Failure):
+        app.configure(config, '1')
+    assert app.CONFIG.read_bytes() == before
+
+
+def test_status_does_not_cache_replaced_unverified_certificate(app, config, monkeypatch):
+    current = app.STATE / 'certs/current'
+    current.mkdir(parents=True)
+    chain = current / 'fullchain.pem'
+    chain.write_bytes(b'OLD')
+    monkeypatch.setattr(app, 'certificate_status', lambda _: {'state': 'present'})
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: SimpleNamespace(
+        collect=lambda _: {'checks': []}, display=lambda _: None))
+    monkeypatch.setattr(app, 'run', lambda *a, **k: result())
+    monkeypatch.setattr(app, 'validate_certificate', lambda *_: b'OLD-DER')
+    monkeypatch.setattr(app, 'verify_served', lambda *a, **k: chain.write_bytes(b'NEW'))
+    app.status(config, interactive=True)
+    assert app._menu_tls_check['success'] is False
+
+
+def test_local_tls_rejects_certificate_change_during_check(app, config, monkeypatch):
+    current = app.STATE / 'certs/current'
+    current.mkdir(parents=True)
+    chain = current / 'fullchain.pem'
+    chain.write_bytes(b'OLD')
+    monkeypatch.setattr(app, 'validate_certificate', lambda *_: b'OLD-DER')
+    monkeypatch.setattr(app, 'verify_served', lambda *a, **k: chain.write_bytes(b'NEW'))
+    with pytest.raises(app.Failure):
+        app.local_self_test(config)
+    assert app._menu_tls_check['success'] is False
+
+
 def test_ipv6_unavailable_is_not_reported_as_busy_http(app, monkeypatch):
     import errno
     binds = []

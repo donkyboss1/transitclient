@@ -29,6 +29,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from types import SimpleNamespace
 import urllib.request
 from urllib.parse import urlsplit
 import uuid
@@ -45,6 +46,7 @@ STAGING = 'https://acme-staging-v02.api.letsencrypt.org/directory'
 ACME_TIMEOUT = 900
 LAUNCHER = Path('/usr/local/bin/transitclient')
 ADMIN = 'unix//config/transitclient-admin.sock'
+_menu_tls_check = {}
 
 
 class Failure(Exception):
@@ -126,11 +128,9 @@ def change_template(config, selected=None, *, approved=False):
 
 
 def confirm(prompt, *, english=False):
-    try:
-        answer = input(prompt + (' [y/N]: ' if english else ' [да/нет]: ')).strip().lower()
-        return answer in ('y', 'yes') if english else answer == 'да'
-    except (EOFError, KeyboardInterrupt) as exc:
-        raise Failure('Подтверждение не получено. Изменения не применены.', 'CANCELLED') from exc
+    # Propagate EOF/interrupt through the lifecycle's finally/rollback handlers.
+    answer = input(prompt + (' [y/N]: ' if english else ' [да/нет]: ')).strip().lower()
+    return answer in ('y', 'yes') if english else answer == 'да'
 
 
 def run(args, *, check=True, timeout=60, input=None):
@@ -885,9 +885,10 @@ def recover_configuration():
     journal.unlink()
 
 
-def configure(config):
-    print('⚙️ Настройка: 1 HTTP-порт · 2 VPN-порт · 3 HTTPS-порт · 4 Docker-сеть · 0 назад')
-    choice = input('Выберите настройку [1]: ').strip() or '1'
+def configure(config, choice=None):
+    if choice is None:
+        print('⚙️ Настройка: 1 HTTP-порт · 2 VPN-порт · 3 HTTPS-порт · 4 Docker-сеть · 0 назад')
+        choice = input('Выберите настройку: ').strip()
     candidate = dict(config)
     if choice == '0':
         return config
@@ -916,6 +917,12 @@ def configure(config):
             raise Failure('HTTPS-порт host занят. Измените его перед переключением.', 'HTTPS_PORT_BUSY')
     else:
         raise Failure('Неизвестная настройка.', 'INVALID_OPTION')
+    labels = {'challenge_port': 'HTTP-порт', 'vpn_port': 'VPN-порт',
+              'local_port': 'Локальный HTTPS-порт', 'docker_network': 'Docker-сеть',
+              'vpn_container': 'Контейнер ноды'}
+    for key, label in labels.items():
+        if config.get(key) != candidate.get(key):
+            print(f"{label}: {config.get(key) or 'не задано'} → {candidate.get(key) or 'не задано'}")
     print(f"Домен сохраняется: {candidate['domain']}; VPN: {candidate.get('vpn_port')}; "
           f"HTTP: {candidate['challenge_port']}; target: {target(candidate)}.")
     if not confirm('Маршрут в боте согласован, применить только эти изменения?'):
@@ -1359,7 +1366,7 @@ def certificate_status(config):
         return {'state': 'invalid', 'error': 'CERT_UNREADABLE'}
 
 
-def status(config, diagnose=False, json_output=False):
+def status(config, diagnose=False, json_output=False, interactive=False):
     diagnostics = diagnostic_module()
     report = diagnostics.collect(config)
     report['installation'] = {'configured': config is not None,
@@ -1407,10 +1414,14 @@ def status(config, diagnose=False, json_output=False):
                    or timer.get('NextElapseUSecRealtime', '') in ('', '0', 'n/a')):
         report['checks'].append({'code': 'RENEW_TIMER_INACTIVE', 'status': 'error',
                                  'message': 'Автоматическое продление не подтверждено: проверьте enabled/active и следующий запуск таймера.'})
+    verified_identity = None
     if config and (STATE / 'certificate-transaction.json').exists():
         report['checks'].append({'code': 'CERT_SWITCH_PENDING', 'status': 'unknown',
                                  'message': 'Переключение сертификата не завершено; status не запускает recovery.'})
     elif config:
+        if interactive:
+            import client_panel
+            verified_identity = client_panel.tls_identity(SimpleNamespace(**globals()), config)
         try:
             verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem',
                                                         STATE / 'certs/current/key.pem'), attempts=1)
@@ -1419,6 +1430,26 @@ def status(config, diagnose=False, json_output=False):
         except (Failure, OSError, ValueError, subprocess.SubprocessError) as exc:
             report['checks'].append({'code': 'CERT_NOT_APPLIED', 'status': 'error',
                                      'message': str(exc) if isinstance(exc, Failure) else 'Не удалось проверить сертификат/HTTPS. Проверьте наличие файлов и Caddy.'})
+    if interactive:
+        import client_panel
+        identity = client_panel.tls_identity(SimpleNamespace(**globals()), config) if config else None
+        checked = any(item['code'] in ('CERT_SERVED', 'CERT_NOT_APPLIED') for item in report['checks'])
+        if checked:
+            _menu_tls_check.clear()
+            _menu_tls_check.update(at=int(time.time()), identity=verified_identity,
+                                   success=identity is not None and identity == verified_identity
+                                   and any(item['code'] == 'CERT_SERVED' for item in report['checks']))
+        certificate = report['installation']['certificate']
+        print('📊 Transit Client · ' + report['installation']['version'])
+        print('Домен: ' + (config['domain'] if config else 'не настроен'))
+        print('Сертификат: ' + {'missing': 'отсутствует', 'invalid': 'повреждён',
+                               'expired': 'просрочен', 'present': 'действителен на диске'}.get(certificate['state'], 'неизвестно'))
+        if 'days_remaining' in certificate:
+            print('Осталось дней: ' + str(certificate['days_remaining']))
+        print('Сайт: ' + client_panel.sanitize(report['installation']['site'].get('name', 'неизвестно')))
+        print('Незавершённые операции: ' + ('есть → Диагностика' if report['pending'] else 'нет'))
+        diagnostics.display(report)
+        return report
     if json_output:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return report
@@ -1440,12 +1471,15 @@ def status(config, diagnose=False, json_output=False):
     return report
 
 
-def guide(config):
+def guide(config, interactive=False):
     print('📖 Существующий веб-сервер: интеграция только по инструкции.')
     print('Инструкция: https://github.com/donkyboss1/transitclient/blob/main/docs/integration.md')
     if config:
-        print('REALITY (несекретные поля): ' + json.dumps({'target': target(config), 'xver': 0,
-                                                        'serverNames': [config['domain']]}, ensure_ascii=False))
+        if interactive:
+            print(f"REALITY: target {target(config)} · serverNames {config['domain']} · xver 0")
+        else:
+            print('REALITY (несекретные поля): ' + json.dumps({'target': target(config), 'xver': 0,
+                                                            'serverNames': [config['domain']]}, ensure_ascii=False))
         print('Для bridge VPN подключите ноду к выбранной сети самостоятельно. '
               'Не используйте её loopback для доступа к Caddy на host.')
     print('Нода/панель не устанавливается и не изменяется. TCP listener не доказывает исправность REALITY.')
@@ -1546,6 +1580,24 @@ def vpn_self_test(config):
     print('✅ VPN-контейнер достигает нужного HTTPS target (SNI, trust, TLS 1.3/h2). REALITY credentials не проверялись.')
 
 
+def local_self_test(config):
+    """Explicit read-only TLS test, never performed while drawing a menu."""
+    import client_panel
+    identity = client_panel.tls_identity(SimpleNamespace(**globals()), config)
+    _menu_tls_check.clear()
+    _menu_tls_check.update(at=int(time.time()), identity=identity, success=False)
+    expected = validate_certificate(config, STATE / 'certs/current/fullchain.pem',
+                                    STATE / 'certs/current/key.pem')
+    verify_served(config, expected, attempts=1)
+    _menu_tls_check.update(at=int(time.time()), success=identity is not None and
+                           identity == client_panel.tls_identity(SimpleNamespace(**globals()), config))
+    if not _menu_tls_check['success']:
+        raise Failure('Сертификат или маршрут изменился во время проверки. Повторите самопроверку.',
+                      'HTTPS_CHANGED')
+    print('✅ Локальная HTTPS подтверждена: сертификат, SNI, trust, TLS 1.3/h2.')
+    print('REALITY требует отдельного подключения клиента.')
+
+
 def update(config, args):
     """Only owner-configured target release. No invented publication address."""
     url = args.package_url or config.get('package_url')
@@ -1580,6 +1632,9 @@ def update(config, args):
         for name in ('selfsteal.py', 'selfsteal.sh', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'templates.json', 'vendor/acme.sh', 'dependencies.json', 'docs/integration.md'):
             if not (extracted / name).is_file():
                 raise Failure('Неполный артефакт обновления.')
+        if tuple(int(part) for part in version.split('.')) >= (1, 4, 0):
+            if not all((extracted / name).is_file() for name in ('terminal_ui.py', 'client_panel.py')):
+                raise Failure('Неполный артефакт обновления: отсутствует интерфейс.')
         deps = read_json(extracted / 'dependencies.json')
         if hashlib.sha256((extracted / 'vendor/acme.sh').read_bytes()).hexdigest() != deps['acme']['sha256']:
             raise Failure('acme.sh в обновлении не соответствует манифесту.')
@@ -1618,7 +1673,7 @@ def uninstall():
     print(f'Ресурсы: {LAUNCHER}, свои tenant-selfsteal units и Compose проект {PROJECT}.')
     print('⚠️ VPN selfsteal target перестанет работать. Данные/сертификаты будут сохранены в backup.')
     if input('Удалить ресурсы tenant-selfsteal [да/нет]? ').strip().lower() != 'да':
-        raise Failure('Удаление отменено.')
+        raise Failure('Удаление отменено.', 'CANCELLED')
     check_install_resources()
     assert_compose_owned()
     run(['systemctl', 'disable', '--now', 'tenant-selfsteal-renew.timer',
@@ -1644,11 +1699,21 @@ def uninstall():
 
 def dispatch(args):
     command = args.command
+    interactive = getattr(args, '_menu_mode', False)
+    if command == 'self-test' and interactive and not args.http01 and not args.vpn:
+        config = safe_config()
+        if config is None:
+            raise Failure('Сначала завершите установку.', 'NOT_INSTALLED')
+        local_self_test(config)
+        return 0
     if command in ('status', 'diagnose', 'self-test') and not args.http01 and not args.vpn:
-        report = status(safe_config(), command != 'status', args.json)
+        if interactive:
+            report = status(safe_config(), command != 'status', False, interactive=True)
+        else:
+            report = status(safe_config(), command != 'status', args.json)
         return 1 if command == 'self-test' and any(item['status'] == 'error' for item in report['checks']) else 0
     if command == 'guide':
-        guide(safe_config())
+        guide(safe_config(), interactive=True) if interactive else guide(safe_config())
         return 0
     if command == 'version':
         print('transitclient ' + (PACKAGE / 'VERSION').read_text().strip())
@@ -1725,7 +1790,7 @@ def dispatch(args):
         config = validate_config(read_json(CONFIG))
         if command == '_recover':
             return 0
-        {'renew': lambda: renew(config), 'configure': lambda: configure(config),
+        {'renew': lambda: renew(config), 'configure': lambda: configure(config, getattr(args, '_configure_choice', None)),
          'update': lambda: update(config, args), 'template': lambda: change_template(config, select_template(args.template, rollback=True)),
          'uninstall': uninstall}[command]()
     return 0
@@ -1734,7 +1799,10 @@ def dispatch(args):
 def perform(args):
     try:
         return dispatch(args)
-    except (Failure, OSError, ValueError, KeyError, TypeError, EOFError, http.client.HTTPException, subprocess.SubprocessError) as exc:
+    except (Failure, OSError, ValueError, KeyError, TypeError, http.client.HTTPException, subprocess.SubprocessError) as exc:
+        if isinstance(exc, Failure) and exc.code == 'CANCELLED':
+            print('Действие отменено.')
+            return 0 if getattr(args, '_menu_mode', False) else 1
         message = str(exc) if isinstance(exc, Failure) else 'Не удалось завершить операцию: ' + type(exc).__name__ + '. Используйте diagnose.'
         code = exc.code if isinstance(exc, Failure) else type(exc).__name__
         if STATE.exists() and CONFIG.exists() and args.command not in ('status', 'diagnose', 'guide', 'self-test', '_cleanup', '_open'):
@@ -1745,29 +1813,8 @@ def perform(args):
 
 
 def menu(args):
-    if not sys.stdin.isatty():
-        raise Failure('Для меню нужен терминал. Укажите команду status/diagnose либо откройте интерактивный Bash.', 'TTY_REQUIRED')
-    operations = {'1': 'install', '2': 'configure', '3': 'status', '4': 'diagnose',
-                  '5': 'renew', '6': 'update', '7': 'guide', '8': 'uninstall', '9': 'self-test', '10': 'template'}
-    while True:
-        config = safe_config()
-        print('\n🚀 Транзит · transitclient ' + (PACKAGE / 'VERSION').read_text().strip())
-        print('📊 ' + (f"{config['domain']} · VPN {config.get('vpn_port') or '?'} · HTTP {config['challenge_port']} · HTTPS {target(config)}" if config else 'Ещё не настроен'))
-        print('1 🚀 Установка\n2 ⚙️ Настройка\n3 📊 Статус\n4 🔍 Диагностика\n5 🔐 Проверить продление\n6 🔄 Обновить\n7 📖 Инструкция VPN\n8 🗑️ Удаление\n9 🧪 Самопроверка\n10 🎨 Сайт-заглушка\n0 ⬅️ Выход')
-        choice = input('Выберите действие: ').strip()
-        if choice == '0':
-            return 0
-        if choice not in operations:
-            print('⚠️ Неизвестный пункт меню.')
-            continue
-        selected = argparse.Namespace(**vars(args))
-        selected.command = operations[choice]
-        if selected.command == 'self-test':
-            test_mode = ask('Проверка: 1 локальная, 2 HTTP-путь, 3 из VPN-контейнера', '1')
-            selected.http01 = test_mode == '2'
-            selected.vpn = test_mode == '3'
-        perform(selected)
-        input('Нажмите Enter для возврата в меню…')
+    import terminal_ui
+    return terminal_ui.run(sys.modules.get(__name__) or SimpleNamespace(**globals()), args)
 
 
 def main():
@@ -1789,7 +1836,7 @@ def main():
     parser.add_argument('--firewall', choices=['ufw', 'manual'], help='Управление UFW (по умолчанию) или собственный firewall')
     parser.add_argument('--probe-token', help=argparse.SUPPRESS)
     parser.add_argument('--json', action='store_true', help='JSON отчёт status/diagnose/self-test')
-    parser.add_argument('--no-color', action='store_true', help='Без ANSI цветов (по умолчанию)')
+    parser.add_argument('--no-color', action='store_true', help='Без ANSI цветов в интерактивном меню')
     parser.add_argument('--http01', action='store_true', help='Явный временный HTTP self-test, без ACME')
     parser.add_argument('--vpn', action='store_true', help='Явная TLS-проверка в указанном VPN-контейнере')
     args = parser.parse_args()
@@ -1801,8 +1848,11 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         result = menu(args) if args.command == 'menu' else perform(args)
-    except (Failure, EOFError, KeyboardInterrupt) as exc:
-        print('❌ ' + (str(exc) if isinstance(exc, Failure) else 'Выход без подтверждения.'), file=sys.stderr)
+    except (EOFError, KeyboardInterrupt) as exc:
+        print('\nДействие отменено.' if isinstance(exc, KeyboardInterrupt) else '\nВыход.')
+        result = 130 if isinstance(exc, KeyboardInterrupt) else 0
+    except Failure as exc:
+        print('❌ ' + str(exc), file=sys.stderr)
         result = 1
     sys.exit(result)
 

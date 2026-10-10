@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Offline acceptance of the real menu in a Linux controlling PTY.
+
+Run: python3 tests/pty_menu_check.py (stdlib only; no pytest required).
+Assertions fixed before implementation: 0/back, real keyboard SIGINT and EOF,
+empty/invalid selection, Enter-gated results, cancel before installation mutation,
+all self-test modes, template navigation, incomplete/Docker-unknown summaries,
+80x40/48x20 layouts, clear/home without clearing scrollback, NO_COLOR/no-color,
+TERM=dumb and redirected output. Every host operation/network call is forbidden.
+The fake dispatcher exercises navigation; lifecycle rollback remains covered by
+the separate offline pytest suite, not by the fake operation below.
+"""
+import argparse
+import errno
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
+import unicodedata
+
+ROOT = Path(__file__).resolve().parents[1]
+PROMPT = 'Выберите действие:'
+PAUSE = 'Нажмите Enter'
+SGR = re.compile(r'\x1b\[[0-9;]*m')
+CSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+
+def line_width(text):
+    """Independent width estimate for menu emoji, Cyrillic and variation selectors."""
+    widths = []
+    joined = False
+    for char in text:
+        if char == '\u200d':
+            joined = True
+            continue
+        if char == '\ufe0f':
+            if widths:
+                widths[-1] = max(2, widths[-1])
+            continue
+        if unicodedata.combining(char) or char == '\ufe0e':
+            continue
+        width = 2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+        if joined and widths:
+            widths[-1] = max(widths[-1], width)
+            joined = False
+        else:
+            widths.append(width)
+    return sum(widths)
+
+
+def child(scenario, no_color):
+    sys.path.insert(0, str(ROOT))
+    import selfsteal as app
+    import client_panel
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('FORBIDDEN_REAL_OPERATION')
+
+    def audit(event, args):
+        if event in ('subprocess.Popen', 'socket.connect', 'socket.getaddrinfo',
+                     'urllib.Request', 'os.system'):
+            forbidden()
+
+    sys.addaudithook(audit)
+    for name in ('run', 'dependencies', 'install', 'renew', 'update', 'uninstall',
+                 'verified_download', 'abort_acme', 'open_firewall', 'cleanup_firewall',
+                 'require_host', 'http_self_test', 'vpn_self_test'):
+        setattr(app, name, forbidden)
+    config = dict(domain='node.example.com', vpn_port=443, challenge_port=8080,
+                  local_port=9443, docker_network='', vpn_container='', relay_ip='',
+                  ca=app.PRODUCTION, staging_ca_file=None, firewall='manual')
+    with tempfile.TemporaryDirectory(prefix='transitclient-pty-') as directory:
+        folder = Path(directory)
+        app.STATE = folder / 'state'
+        app.STATE.mkdir()
+        app.CONFIG = folder / 'config.json'
+        app.INSTALL = folder / 'install'
+        app.UNITS = folder / 'units'
+        app.LOCK = folder / 'lock'
+        app.safe_config = lambda: dict(config)
+        state = 'Установка не завершена' if scenario == 'incomplete' else 'Работает'
+        docker = 'Docker недоступен · неизвестно' if scenario == 'docker' else state
+        rows = [('Сервер', 'pty-host · Ubuntu 26.04'), ('Caddy', docker),
+                ('Домен', config['domain']), ('Порты', 'VPN 443 · HTTP 8080 · HTTPS 127.0.0.1:9443'),
+                ('SSL', 'Действителен на диске · 30 дней · Test issuer'),
+                ('HTTPS', 'Не подтверждён · Самопроверка'),
+                ('Продление', 'Таймер включён · следующий запуск завтра'), ('Сайт', 'Тестовый сайт')]
+        client_panel.snapshot = lambda *a, **k: dict(rows=rows, hint='HTTPS не подтверждён → Самопроверка',
+                                                    config=dict(config), installation=state)
+
+        def fake_perform(args):
+            command = args.command
+            if command == 'install':
+                approved = app.installation_plan(config)
+                print('INSTALL_APPROVED' if approved else 'INSTALL_CANCELLED', flush=True)
+                if approved:
+                    forbidden()
+                return 0
+            if scenario == 'interrupt-operation' and command == 'renew':
+                print('OPERATION_RUNNING', flush=True)
+                try:
+                    while True:
+                        signal.pause()
+                finally:
+                    print('ROLLBACK_FINISHED', flush=True)
+            if command == 'configure':
+                print('CONFIG_CHOICE=' + str(getattr(args, '_configure_choice', '?')), flush=True)
+                input('Новое значение: ')
+            if command == 'diagnose':
+                print('TEST_ERROR: безопасная тестовая ошибка', flush=True)
+                return 1
+            if command == 'self-test':
+                print('SELF_TEST=' + ('http01' if args.http01 else 'vpn' if args.vpn else 'local'), flush=True)
+            if command == 'template':
+                print('TEMPLATE=' + str(args.template), flush=True)
+            print('TEST_SUCCESS=' + command, flush=True)
+            return 0
+
+        app.perform = fake_perform
+        args = SimpleNamespace(command='menu', no_color=no_color, http01=False, vpn=False,
+                               template=None, json=False)
+        code = app.menu(args)
+        print('HARNESS_EXIT=' + str(code), flush=True)
+
+
+class Session:
+    def __init__(self, scenario='normal', *, columns=80, lines=40, no_color=False, env=None):
+        import fcntl
+        import pty
+        import termios
+        pid, fd = pty.fork()
+        if pid == 0:
+            variables = dict(os.environ, TERM='xterm-256color', PYTHONUNBUFFERED='1')
+            variables.pop('NO_COLOR', None)
+            variables.update(env or {})
+            argv = [sys.executable, str(Path(__file__).resolve()), '--child', scenario]
+            if no_color:
+                argv.append('--no-color')
+            os.execve(sys.executable, argv, variables)
+        self.pid, self.fd = pid, fd
+        self.output = ''
+        self.offset = 0
+        self.closed = False
+        self.status = None
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', lines, columns, 0, 0))
+
+    def send(self, value):
+        os.write(self.fd, value.encode('utf-8'))
+
+    def read(self, seconds=0.1):
+        if self.closed:
+            return ''
+        ready, _, _ = select.select([self.fd], [], [], seconds)
+        if not ready:
+            return ''
+        try:
+            data = os.read(self.fd, 65536)
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+            data = b''
+        if not data:
+            self.closed = True
+            return ''
+        # A read may split a multibyte character. Keep raw bytes until complete.
+        pending = getattr(self, '_pending', b'') + data
+        try:
+            decoded = pending.decode('utf-8')
+            self._pending = b''
+        except UnicodeDecodeError as exc:
+            decoded = pending[:exc.start].decode('utf-8')
+            self._pending = pending[exc.start:]
+        self.output += decoded
+        return decoded
+
+    def expect(self, text, seconds=5):
+        deadline = time.monotonic() + seconds
+        while True:
+            found = self.output.find(text, self.offset)
+            if found >= 0:
+                self.offset = found + len(text)
+                return
+            if self.closed or time.monotonic() >= deadline:
+                raise AssertionError('Expected ' + repr(text) + '\n' + repr(self.output[-3000:]))
+            self.read(0.1)
+
+    def finish(self):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            self.read(0.1)
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self.status = os.waitstatus_to_exitcode(status)
+                while not self.closed:
+                    self.read(0.1)
+                assert self.status == 0, self.output
+                assert 'Traceback' not in self.output, self.output
+                assert 'Выход без подтверждения' not in self.output, self.output
+                assert 'FORBIDDEN_REAL_OPERATION' not in self.output, self.output
+                return
+        raise AssertionError('Child did not exit; possible EOF loop\n' + self.output[-2000:])
+
+    def close(self):
+        if self.status is None:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+                os.waitpid(self.pid, 0)
+            except ProcessLookupError:
+                pass
+        os.close(self.fd)
+
+    def __enter__(self):
+        self.expect(PROMPT)
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def back_and_cancel():
+    for option, title in [('2', 'Настройки'), ('9', 'Самопроверка'), ('10', 'Сайт')]:
+        with Session() as session:
+            session.send(option + '\n')
+            session.expect(title)
+            session.expect(PROMPT)
+            session.send('0\n')
+            session.expect(PROMPT)
+            session.send(option + '\n')
+            session.expect(PROMPT)
+            session.send('\x03')
+            session.expect('Действие отменено')
+            session.expect(PROMPT)
+            session.send('0\n')
+            session.finish()
+    with Session() as session:
+        session.send('\x03')
+        session.finish()
+
+
+def invalid_and_results():
+    with Session() as session:
+        for option in ('', 'invalid', '99'):
+            session.send(option + '\n')
+            session.expect('Неизвестный')
+            session.expect(PROMPT)
+        for option, marker in [('3', 'TEST_SUCCESS=status'), ('4', 'TEST_ERROR')]:
+            session.send(option + '\n')
+            session.expect(marker)
+            session.expect(PAUSE)
+            start = len(session.output)
+            session.read(0.2)
+            assert '\x1b[2J' not in session.output[start:], 'Result cleared before Enter'
+            session.send('\n')
+            session.expect(PROMPT)
+        session.send('0\n')
+        session.finish()
+    for menu in ('2', '9', '10'):
+        with Session() as session:
+            session.send(menu + '\n')
+            session.expect(PROMPT)
+            for option in ('', 'invalid', '99'):
+                session.send(option + '\n')
+                session.expect('Неизвестный')
+                session.expect(PROMPT)
+            assert 'TEST_SUCCESS=' not in session.output
+            assert 'TEMPLATE=' not in session.output
+            session.send('0\n')
+            session.expect(PROMPT)
+            session.send('0\n')
+            session.finish()
+
+
+def operation_modes():
+    with Session() as session:
+        session.send('9\n')
+        session.expect(PROMPT)
+        for option, marker in [('1', 'local'), ('2', 'http01'), ('3', 'vpn')]:
+            session.send(option + '\n')
+            session.expect('SELF_TEST=' + marker)
+            session.expect(PAUSE)
+            session.send('\n')
+            session.expect(PROMPT)
+        session.send('0\n')
+        session.expect(PROMPT)
+        session.send('10\n')
+        session.expect(PROMPT)
+        assert '11' in session.output
+        for option, marker in [('i', 'builtin'), ('r', 'random'), ('b', 'rollback')]:
+            session.send(option + '\n')
+            session.expect('TEMPLATE=' + marker)
+            session.expect(PAUSE)
+            session.send('\n')
+            session.expect(PROMPT)
+        session.send('0\n')
+        session.expect(PROMPT)
+        session.send('0\n')
+        session.finish()
+
+
+def input_cancel_and_operation_interrupt():
+    with Session() as session:
+        session.send('2\n')
+        session.expect(PROMPT)
+        session.send('1\n')
+        session.expect('Новое значение:')
+        session.send('\x03')
+        session.expect('Действие отменено')
+        session.expect(PROMPT)
+        session.send('0\n')
+        session.finish()
+    with Session() as session:
+        session.send('2\n')
+        session.expect(PROMPT)
+        session.send('4\n')
+        session.expect(PROMPT)
+        session.send('0\n')
+        session.expect(PROMPT)
+        session.send('4\n')
+        session.expect(PROMPT)
+        session.send('\x03')
+        session.expect('Действие отменено')
+        session.expect(PROMPT)
+        session.send('0\n')
+        session.expect(PROMPT)
+        session.send('0\n')
+        session.finish()
+    with Session('interrupt-operation') as session:
+        session.send('5\n')
+        session.expect('OPERATION_RUNNING')
+        session.send('\x03')
+        session.expect('ROLLBACK_FINISHED')
+        session.expect('Действие отменено')
+        session.expect(PROMPT)
+        session.send('0\n')
+        session.finish()
+
+
+def eof_at_every_level():
+    for path in ([], ['2'], ['9'], ['10'], ['2', '1'], ['3'], ['1']):
+        with Session() as session:
+            for index, option in enumerate(path):
+                session.send(option + '\n')
+                if path == ['2', '1'] and index == 1:
+                    session.expect('Новое значение:')
+                elif option == '3':
+                    session.expect(PAUSE)
+                elif option == '1':
+                    session.expect('[y/N]')
+                else:
+                    session.expect(PROMPT)
+            session.send('\x04')
+            session.finish()
+
+
+def confirmation_defaults_to_no():
+    with Session() as session:
+        session.send('1\n')
+        session.expect('[y/N]')
+        session.send('\n')
+        session.expect('INSTALL_CANCELLED')
+        session.expect(PAUSE)
+        session.send('\n')
+        session.expect(PROMPT)
+        assert 'INSTALL_APPROVED' not in session.output
+        session.send('0\n')
+        session.finish()
+
+
+def terminal_capabilities_and_layout():
+    for kwargs in ({}, {'columns': 48, 'lines': 20}, {'no_color': True},
+                   {'env': {'NO_COLOR': '1'}}, {'env': {'TERM': 'dumb'}}):
+        with Session(**kwargs) as session:
+            for _ in range(2):
+                session.send('9\n')
+                session.expect(PROMPT)
+                session.send('0\n')
+                session.expect(PROMPT)
+            session.send('0\n')
+            session.finish()
+            output = session.output
+            assert '\x1b[3J' not in output and '\x1bc' not in output
+            if kwargs.get('env', {}).get('TERM') == 'dumb':
+                assert '\x1b' not in output
+            else:
+                assert '\x1b[2J' in output and '\x1b[H' in output
+                screen = output.rsplit('\x1b[2J', 1)[1]
+                screen = CSI.sub('', screen).replace('\r', '')
+                assert screen.count('Transit Client') == 1, screen
+                assert len(screen.splitlines()) <= kwargs.get('lines', 40), screen
+                for line in screen.splitlines():
+                    assert line_width(line) <= kwargs.get('columns', 80), repr(line)
+                for number in ('1)', '2)', '3)', '4)', '5)', '6)', '7)', '8)', '9)', '10)', '0)'):
+                    assert number in screen, screen
+            if kwargs.get('no_color') or kwargs.get('env', {}).get('NO_COLOR'):
+                assert not SGR.search(output), 'Color emitted with no-color'
+    for scenario, marker in [('incomplete', 'Установка не завершена'), ('docker', 'Docker недоступен')]:
+        with Session(scenario) as session:
+            assert marker in session.output
+            session.send('0\n')
+            session.finish()
+
+
+def redirected_output():
+    import pty
+    master, slave = pty.openpty()
+    with tempfile.TemporaryFile() as output:
+        # Use a PTY input but ordinary redirected output in a separate subprocess.
+        try:
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--child', 'normal'],
+                                       stdin=slave, stdout=output, stderr=output,
+                                       env=dict(os.environ, TERM='xterm-256color', PYTHONUNBUFFERED='1'))
+            os.write(master, b'0\n')
+            process.wait(timeout=5)
+            output.seek(0)
+            captured = output.read()
+            assert b'\x1b' not in captured
+            assert b'Traceback' not in captured, captured
+        finally:
+            if 'process' in locals() and process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--child', help=argparse.SUPPRESS)
+    parser.add_argument('--no-color', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.child:
+        child(args.child, args.no_color)
+        return
+    if os.name != 'posix':
+        parser.error('Run in Linux/WSL: python3 tests/pty_menu_check.py')
+    checks = [back_and_cancel, invalid_and_results, operation_modes,
+              input_cancel_and_operation_interrupt, eof_at_every_level,
+              confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output]
+    for check in checks:
+        check()
+        print('PASS ' + check.__name__, flush=True)
+    print('PASS offline PTY acceptance: no installation, ACME or host mutations')
+
+
+if __name__ == '__main__':
+    main()

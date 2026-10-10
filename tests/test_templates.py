@@ -100,6 +100,19 @@ def test_http_verification_failure_restores_site_and_metadata(themes):
     assert not (state / 'site-transaction.json').exists()
 
 
+def test_keyboard_interrupt_restores_site_before_propagating(themes):
+    module, state, package, fetch, atomic = themes
+    module.ensure_site(state, package)
+    atomic(state / 'site-template.json', {'id': 'custom', 'name': 'Previous'})
+    def interrupt(_):
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        module.apply(state, package, '1', fetch, atomic, interrupt)
+    assert (state / 'site/current/index.html').read_bytes() == b'fallback'
+    assert json.loads((state / 'site-template.json').read_text())['id'] == 'custom'
+    assert not (state / 'site-transaction.json').exists()
+
+
 @pytest.mark.parametrize('new_site_visible', [False, True])
 def test_boot_recovery_after_interrupted_directory_swap(themes, new_site_visible):
     module, state, package, _, atomic = themes

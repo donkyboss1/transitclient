@@ -6,9 +6,9 @@ set -euo pipefail
 umask 077
 
 # Publication fills these three values together. Never guess a repository URL.
-RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.3.3.tar.gz'
-RELEASE_VERSION='1.3.3'
-RELEASE_SHA256='1ea39307217466c234b33f2d8572c65fad7b65afb1114f0320dbba96847542a1'
+RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.4.0.tar.gz'
+RELEASE_VERSION='1.4.0'
+RELEASE_SHA256='3351bc56b41903b0d05c024585ee082790d6b0540a8c8b026477cd05a5f47d6c'
 
 fail() { printf '\n❌ %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -135,6 +135,8 @@ def safe_extract(archive_path, destination, version, digest):
         raise ValueError('Каталог распаковки уже существует.')
     required = {'selfsteal.sh', 'selfsteal.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'templates.json', 'docs/integration.md', 'dependencies.json', 'VERSION',
                 'LICENSE', 'NOTICE.md', 'vendor/acme.sh', 'site/index.html'}
+    if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 4, 0):
+        required.update({'client_panel.py', 'terminal_ui.py'})
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0
         for entry in archive:

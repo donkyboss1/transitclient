@@ -16,6 +16,7 @@ def builder(tmp_path, monkeypatch):
     source = tmp_path / 'source'
     source.mkdir()
     for name in ('selfsteal.sh', 'selfsteal.py', 'diagnostics.py', 'build_release.py',
+                 'terminal_ui.py', 'client_panel.py',
                  'VERSION', 'dependencies.json', 'templates.json', 'README.md', 'LICENSE', 'NOTICE.md'):
         (source / name).write_text(name, encoding='utf-8')
     for name in ('docs/integration.md', 'docs/operations.md', 'vendor/acme.sh',
@@ -35,6 +36,7 @@ def test_release_includes_helpers_docs_and_pins_without_state(builder, tmp_path)
     with tarfile.open(destination) as archive:
         names = set(archive.getnames())
         assert {'selfsteal.py', 'diagnostics.py', 'docs/integration.md',
+                'terminal_ui.py', 'client_panel.py',
                 'docs/operations.md', 'vendor/acme.sh', 'dependencies.json'} <= names
         assert '.env' not in names
         assert not any('__pycache__' in name or name.endswith('.pyc') for name in names)

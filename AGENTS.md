@@ -67,6 +67,15 @@
   подтвердил причину EPERM (file capability Caddy при cap_drop ALL), успешные
   caddy version и validate с NET_BIND_SERVICE и прежним сертификатом на Ubuntu
   26.04 / Docker 29.8.2. Боевой HTTPS и продление этим не подтверждены.
+- Проверка интерфейса 1.4.0: 303 passed, 5 skipped (symlink Windows), Ruff,
+  Bash syntax обоих скриптов и 28 controlling PTY/redirect сценариев в WSL Ubuntu.
+  Быстрая панель client_panel.py только читает, команды делят бюджет 2 секунды;
+  terminal_ui.py использует циклы, очистку видимой области без scrollback.
+  HTTPS подтверждается явной проверкой с актуальностью 5 минут и привязкой
+  к домену, target, Docker-сети и сертификату. Тесты: tests/pty_menu_check.py;
+  макет, карта переходов и условия приёмки: docs/terminal-interface.md.
+  Отмена проходит через прежние cleanup/rollback; реальные установка/ACME
+  в этих проверках не выполнялись.
 - Версии компонентов фиксировать; релиз собирается локально. Не заменять
   содержимое архива уже опубликованной версии.
 - Коммит и push делает владелец. В финальном ответе дать готовые PowerShell

@@ -77,10 +77,11 @@ def firewall_module():
 
 def select_template(value=None, rollback=False):
     catalog = template_module().catalog(PACKAGE)
-    print('🎨 Сайты-заглушки')
-    print('0 🏠 Встроенная страница · r 🎲 Случайный сайт' + (' · b ↩️ Прежний сайт' if rollback else ''))
-    for theme in catalog['templates']:
-        print(theme['id'] + ' ' + theme['name'])
+    if value is None:
+        print('🎨 Сайты-заглушки')
+        print('0 🏠 Встроенная страница · r 🎲 Случайный сайт' + (' · b ↩️ Прежний сайт' if rollback else ''))
+        for theme in catalog['templates']:
+            print(theme['id'] + ' ' + theme['name'])
     choice = value if value is not None else ask('Выберите сайт', 'r')
     if choice in ('r', 'random'):
         choice = secrets.choice(catalog['templates'])['id']
@@ -124,9 +125,10 @@ def change_template(config, selected=None, *, approved=False):
     print('✅ Сайт: ' + metadata['name'] + '. Сертификат и порты не изменены.')
 
 
-def confirm(prompt):
+def confirm(prompt, *, english=False):
     try:
-        return input(prompt + ' [да/нет]: ').strip().lower() == 'да'
+        answer = input(prompt + (' [y/N]: ' if english else ' [да/нет]: ')).strip().lower()
+        return answer in ('y', 'yes') if english else answer == 'да'
     except (EOFError, KeyboardInterrupt) as exc:
         raise Failure('Подтверждение не получено. Изменения не применены.', 'CANCELLED') from exc
 
@@ -447,12 +449,50 @@ def dependencies():
         candidate.chmod(0o700)
         os.replace(candidate, compose)
     run(['docker', 'pull', manifest['caddy']['image']], timeout=300)
+    validate_caddy_runtime(manifest['caddy']['image'])
+
+
+def validate_caddy_runtime(image):
+    # Check executable capabilities before any ACME request. Official Caddy
+    # carries cap_net_bind_service=ep and cannot exec with an empty bounding set.
+    result = run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
+                  '--cap-drop', 'ALL', '--cap-add', 'NET_BIND_SERVICE',
+                  '--security-opt', 'no-new-privileges', image, 'caddy', 'version'], check=False)
+    if result.returncode:
+        raise Failure('Caddy не запускается в изолированной проверке. ' + compose_error_detail(result),
+                      'CADDY_RUNTIME_FAILED')
 
 
 def compose(*args, check=True):
     assert_compose_owned()
-    return run([STATE / 'docker-compose', '-p', PROJECT, '-f', STATE / 'compose.yaml',
-                *args], check=check, timeout=120)
+    result = run([STATE / 'docker-compose', '-p', PROJECT, '-f', STATE / 'compose.yaml',
+                  *args], check=False, timeout=120)
+    if check and result.returncode:
+        operation = args[0] if args and args[0] in ('run', 'up', 'exec', 'ps', 'down', 'config', 'version') else 'command'
+        code = 'CADDY_VALIDATE_FAILED' if operation == 'run' and 'validate' in args else 'COMPOSE_COMMAND_FAILED'
+        detail = compose_error_detail(result)
+        raise Failure(f'Compose: {operation}, код {result.returncode}. {detail}', code)
+    return result
+
+
+def compose_error_detail(result):
+    """Classify known errors, never echo output that can contain keys or tokens."""
+    output = (getattr(result, 'stderr', b'') + getattr(result, 'stdout', b'')).decode('utf-8', errors='replace').lower()
+    for patterns, message in (
+        (('client version', 'api version'), 'Несовместимость Docker API; проверьте версии Docker и Compose.'),
+        (('read-only file system',), 'Попытка записи в файловую систему только для чтения; проверьте mounts Caddy.'),
+        (('permission denied', 'operation not permitted'), 'Доступ запрещён; проверьте права файлов и ограничения контейнера.'),
+        (('address already in use', 'port is already allocated'), 'Адрес или порт занят; чужой процесс не остановлен.'),
+        (('cannot connect to the docker daemon', 'is the docker daemon running'), 'Нет подключения к локальному Docker daemon.'),
+        (('error mounting', 'invalid mount', 'mount source path does not exist'), 'Ошибка монтирования каталогов Caddy.'),
+        (('no such file or directory', 'does not exist'), 'Не найден файл или путь; проверьте конфигурацию и сертификат Caddy.'),
+        (('adapting config', 'parsing caddyfile', 'unrecognized directive'), 'Caddy отклонил конфигурацию.'),
+        (('oci runtime', 'failed to create task', 'failed to create shim'), 'Контейнер не запущен: ошибка OCI runtime.'),
+    ):
+        if any(pattern in output for pattern in patterns):
+            return message
+    return ('Причина не распознана. Проверьте Compose version/config и выполните отдельную '
+            'проверку caddy validate; вывод команд автоматически не публикуется.')
 
 
 def reload_caddy():
@@ -741,6 +781,8 @@ https://{config['domain']}:{port} {{
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
+    # Official Caddy has this file capability; keep it in the bounding set.
+    cap_add: [NET_BIND_SERVICE]
     security_opt: [no-new-privileges:true]
 {networking.rstrip()}
     volumes:
@@ -1164,7 +1206,7 @@ def installation_plan(config):
         print('  Установить пакеты: ' + ', '.join(missing))
     print('  Сертификат: ' + ('тестовый' if config['ca'] == STAGING else "Let's Encrypt") + '; автоматическое продление.')
     print('  Команда управления: transitclient. Нода и существующие сайты сохраняются.')
-    return confirm('Установить?')
+    return confirm('Установить?', english=True)
 
 
 def install(args):
@@ -1229,7 +1271,7 @@ def install(args):
         print('🛡️ ' + change)
     chosen_template = None
     if not CONFIG.exists() or getattr(args, 'template', None) is not None:
-        chosen_template = select_template(getattr(args, 'template', None))
+        chosen_template = select_template(getattr(args, 'template', None) or 'random')
         print('🎨 Выбранный сайт: ' + chosen_template)
     if not installation_plan(config):
         raise Failure('Установка отменена.', 'CANCELLED')
@@ -1632,15 +1674,26 @@ def dispatch(args):
         if config is None:
             raise Failure('Установка ещё не настроена.', 'NOT_INSTALLED')
         check_install_resources()
+        chain, key = STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem'
+        has_certificate = chain.is_file() and key.is_file()
+        if not has_certificate:
+            assert_compose_owned()
+            if run(['docker', 'ps', '-aq', '--filter', 'label=com.docker.compose.project=' + PROJECT]).stdout.strip():
+                raise Failure('Caddy-контейнер есть, но активный сертификат отсутствует. '
+                              'Сначала восстановите сертификат; пакет не применяется.', 'UPDATE_CERT_MISSING')
         dependencies()
         validate_network(config)
         render_caddy(config)
         install_units()
         install_launcher()
         mark_package(config)
+        if not has_certificate:
+            compose('config', '--quiet')
+            print('Пакет обновлён для незавершённой установки. Сертификаты сохранены; '
+                  'продолжите через transitclient renew.')
+            return 0
         compose('up', '-d', '--no-build', 'caddy')
         reload_caddy()
-        chain, key = STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem'
         verify_served(config, validate_certificate(config, chain, key))
         return 0
     with lifecycle_lock():

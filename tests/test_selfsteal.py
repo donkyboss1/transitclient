@@ -74,6 +74,48 @@ def test_first_setup_only_asks_domain_and_three_ports(app, monkeypatch):
     assert saved['firewall'] == 'ufw' and saved['relay_ip'] == ''
 
 
+@pytest.mark.parametrize('answer,approved', [('', False), ('n', False), ('N', False),
+                                          ('no', False), ('да', False), ('y', True), ('Y', True), ('yes', True)])
+def test_install_confirmation_defaults_to_no(app, config, monkeypatch, answer, approved):
+    prompts = []
+    def reply(prompt):
+        prompts.append(prompt)
+        return answer
+    monkeypatch.setattr('builtins.input', reply)
+    assert app.installation_plan(config) == approved
+    assert prompts == ['Установить? [y/N]: ']
+
+
+def test_explicit_random_template_needs_no_input_and_no_catalog_dump(app, monkeypatch, capsys):
+    monkeypatch.setattr('builtins.input', lambda *_: pytest.fail('Default random selection needs no prompt'))
+    selected = app.select_template('random')
+    assert selected in [str(i) for i in range(1, 12)]
+    assert capsys.readouterr().out == ''
+
+
+@pytest.mark.parametrize('output,expected', [
+    (b'permission denied; token=PRIVATE', 'Доступ запрещён'),
+    (b'OCI runtime create failed; password=PRIVATE', 'OCI runtime'),
+    (b'Error adapting config; secret=PRIVATE', 'отклонил конфигурацию'),
+    (b'unknown error; -----BEGIN PRIVATE KEY-----', 'Причина не распознана'),
+])
+def test_compose_failure_identifies_stage_without_echoing_output(app, monkeypatch, output, expected):
+    monkeypatch.setattr(app, 'assert_compose_owned', lambda: None)
+    monkeypatch.setattr(app, 'run', lambda *_, **__: SimpleNamespace(returncode=255, stdout=b'', stderr=output))
+    with pytest.raises(app.Failure) as error:
+        app.compose('run', '--rm', '--no-deps', 'caddy', 'caddy', 'validate')
+    assert error.value.code == 'CADDY_VALIDATE_FAILED'
+    assert expected in str(error.value)
+    assert '255' in str(error.value) and 'PRIVATE' not in str(error.value)
+    assert 'token=' not in str(error.value) and 'password=' not in str(error.value) and 'secret=' not in str(error.value)
+
+
+def test_compose_cleanup_can_return_nonzero_without_masking_initial_failure(app, monkeypatch):
+    monkeypatch.setattr(app, 'assert_compose_owned', lambda: None)
+    monkeypatch.setattr(app, 'run', lambda *_, **__: result(code=255))
+    assert app.compose('down', check=False).returncode == 255
+
+
 def test_host_node_is_attributed_without_network_questions(app, config, monkeypatch):
     monkeypatch.setattr('builtins.input', lambda *_: pytest.fail('Host node needs no network questions'))
     monkeypatch.setattr(app, 'run', lambda *_: pytest.fail('Do not inspect or change host container'))
@@ -609,6 +651,9 @@ def test_host_and_bridge_render_never_publish_https(app, config):
     text = (app.STATE / 'compose.yaml').read_text()
     caddy = (app.STATE / 'Caddyfile').read_text()
     assert 'network_mode: host' in text and 'ports:' not in text
+    assert 'cap_drop: [ALL]' in text and 'cap_add: [NET_BIND_SERVICE]' in text
+    assert 'security_opt: [no-new-privileges:true]' in text and 'read_only: true' in text
+    assert 'privileged:' not in text and 'NET_ADMIN' not in text and 'SYS_ADMIN' not in text
     assert 'bind 127.0.0.1' in caddy and app.ADMIN in caddy
     config.update(docker_network='vpn-private', local_port=9543)
     app.render_caddy(config)
@@ -617,6 +662,46 @@ def test_host_and_bridge_render_never_publish_https(app, config):
     assert 'external: true' in text and 'name: vpn-private' in text
     assert 'transitclient-selfsteal' in text
     assert app.target(config) == 'transitclient-selfsteal:9543'
+    assert 'cap_add: [NET_BIND_SERVICE]' in text
+
+
+def test_caddy_exec_failure_is_detected_before_issuance_and_hides_output(app, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, 'run', lambda args, **_: calls.append(args) or
+                        SimpleNamespace(returncode=255, stdout=b'', stderr=b'exec /usr/bin/caddy: operation not permitted; token=PRIVATE'))
+    with pytest.raises(app.Failure) as error:
+        app.validate_caddy_runtime('pinned-image')
+    assert error.value.code == 'CADDY_RUNTIME_FAILED' and 'PRIVATE' not in str(error.value)
+    assert len(calls) == 1 and calls[0][-2:] == ['caddy', 'version']
+    assert '--network' in calls[0] and 'none' in calls[0] and '--cap-add' in calls[0]
+    assert not any(value in calls[0] for value in ('--privileged', '--mount', '-v', '--publish'))
+
+
+def test_update_apply_of_partial_install_never_issues_cert_or_starts_caddy(app, config, monkeypatch):
+    app.atomic_json(app.CONFIG, config)
+    for name in ('require_host', 'check_install_resources', 'assert_compose_owned', 'dependencies',
+                 'install_units', 'install_launcher', 'mark_package'):
+        monkeypatch.setattr(app, name, lambda *_: None)
+    monkeypatch.setattr(app, 'validate_network', lambda _: None)
+    monkeypatch.setattr(app, 'run', lambda *_, **__: result())
+    monkeypatch.setattr(app, 'renew', lambda _: pytest.fail('Update must not issue a certificate'))
+    monkeypatch.setattr(app, 'reload_caddy', lambda: pytest.fail('Partial install has no running Caddy'))
+    calls = []
+    monkeypatch.setattr(app, 'compose', lambda *args, **_: calls.append(args) or result())
+    assert app.dispatch(SimpleNamespace(command='_update-apply')) == 0
+    assert calls == [('config', '--quiet')]
+
+
+def test_update_apply_missing_certificate_does_not_touch_existing_caddy(app, config, monkeypatch):
+    app.atomic_json(app.CONFIG, config)
+    monkeypatch.setattr(app, 'require_host', lambda: None)
+    monkeypatch.setattr(app, 'check_install_resources', lambda: None)
+    monkeypatch.setattr(app, 'assert_compose_owned', lambda: None)
+    monkeypatch.setattr(app, 'run', lambda *_, **__: result(output=b'existing-owned-caddy'))
+    monkeypatch.setattr(app, 'dependencies', lambda: pytest.fail('Conflicting state must fail before mutation'))
+    with pytest.raises(app.Failure) as error:
+        app.dispatch(SimpleNamespace(command='_update-apply'))
+    assert error.value.code == 'UPDATE_CERT_MISSING'
 
 
 def test_certificate_reload_forces_file_reread_on_own_socket(app, monkeypatch):

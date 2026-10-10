@@ -178,6 +178,30 @@ def test_native_filters_and_modified_before_rules_block(fw, config, report):
         fw.plan(config, report, run)
 
 
+@pytest.mark.parametrize('rule', [
+    '-A INPUT -p tcp -m multiport --dports 22 -m set --match-set f2b-sshd src -j REJECT --reject-with icmp-port-unreachable',
+    '-A INPUT -p tcp --dport 22 -j f2b-sshd',
+    '-A f2b-sshd -s 192.0.2.1/32 -j REJECT',
+])
+def test_fail2ban_reports_specific_cause_before_any_mutation(fw, config, report, rule):
+    run = Runner(fw)
+    run.saved += rule + '\n'
+    with pytest.raises(fw.FirewallError) as error:
+        fw.plan(config, report, run)
+    assert error.value.code == 'FIREWALL_FAIL2BAN_PRESENT'
+    assert '--firewall manual' in str(error.value)
+    assert not any(a[0] in ('ufw', 'systemd-run', 'apt-get') and a[1:2] != ['status'] for a in run.calls)
+
+
+def test_manual_mode_never_reads_or_changes_existing_fail2ban(fw, config, report, tmp_path):
+    config['firewall'] = 'manual'
+    def unchanged(*_, **__):
+        pytest.fail('Manual mode must not inspect, enable or change the host firewall')
+    prepared = fw.plan(config, report, unchanged)
+    assert prepared['mode'] == 'manual'
+    assert fw.apply(prepared, config, tmp_path, unchanged, atomic)['status'] == 'unchanged'
+
+
 def test_unknown_nft_chain_policy_blocks(fw, config, report):
     run = Runner(fw)
     run.nft = '{"nftables":[{"chain":{"table":"filter","hook":"input","policy":"drop"}}]}'

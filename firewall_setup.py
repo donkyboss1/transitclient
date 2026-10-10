@@ -98,6 +98,13 @@ def _native_filters(run, docker_host_only=False):
                 args = shlex.split(line)
                 chain = args[1]
                 target = args[args.index('-j') + 1] if '-j' in args else ''
+                sets = [args[i + 1] for i, value in enumerate(args[:-1]) if value == '--match-set']
+                if (chain.startswith('f2b-') or target.startswith('f2b-')
+                        or any(name.startswith('f2b-') for name in sets)):
+                    raise FirewallError('Обнаружены правила Fail2Ban. Автоматическое включение UFW '
+                                        'может изменить порядок блокировок; требуется согласованная интеграция. '
+                                        'Для сохранения текущего firewall используйте install --firewall manual.',
+                                        'FIREWALL_FAIL2BAN_PRESENT')
                 if docker_host_only and (chain == 'FORWARD' and _docker_chain(target)):
                     continue
                 if docker_host_only and _docker_chain(chain) and target in ('RETURN', 'ACCEPT', 'DROP'):

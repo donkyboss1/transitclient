@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -102,12 +101,12 @@ def _renewal(budget):
     next_time = fields.get('NextElapseUSecRealtime', '')
     valid_time = bool(_NEXT_TIME.fullmatch(next_time))
     if enabled and active and valid_time:
-        return '✅ Таймер включён · следующий: ' + next_time, True
+        return '✅ Включено · следующий: ' + next_time, True
     if fields.get('UnitFileState') in ('disabled', 'masked', 'masked-runtime') or fields.get('ActiveState') in ('inactive', 'failed'):
-        return '⏹ Таймер выключен · автоматическое продление не подтверждено', False
+        return '⏹ Выключено · автоматическое продление не подтверждено', False
     if enabled and active:
-        return '⚠ Таймер включён · следующий запуск неизвестен', False
-    return '⚠ Неизвестно · состояние таймера не подтверждено', False
+        return '⚠ Включено · следующий запуск неизвестен', False
+    return '⚠ Неизвестно · автоматическое продление не подтверждено', False
 
 
 def tls_identity(app, config):
@@ -160,21 +159,12 @@ def _certificate(app, config):
     return status + (f' · {issuer}' if issuer else '') + f' · осталось {days} дн.' + (' · тестовый' if result.get('staging') is True else ''), ('soon' if days <= 14 else 'present')
 
 
-def _server():
-    try:
-        release = platform.freedesktop_os_release()
-        os_name = release.get('PRETTY_NAME') or ' '.join(filter(None, (release.get('NAME'), release.get('VERSION_ID'))))
-    except (OSError, AttributeError):
-        os_name = platform.system() + ' ' + platform.release()
-    return sanitize(platform.node() or 'локальный сервер', 70) + ' · ' + sanitize(os_name or 'ОС неизвестна', 100)
-
-
 def _site(app):
     try:
         metadata = json.loads((app.STATE / 'site-template.json').read_text(encoding='utf-8'))
         name = metadata.get('name') if isinstance(metadata, dict) else None
         if isinstance(name, str) and sanitize(name):
-            return sanitize(name)
+            return re.sub(r'^([^\w\s]+)(?=\w)', r'\1 ', sanitize(name))
     except (OSError, ValueError):
         pass
     return 'встроенная страница' if (app.STATE / 'site/current/index.html').is_file() else 'не выбран'
@@ -210,8 +200,8 @@ def snapshot(app):
     renewal, renewal_ok = _renewal(budget) if config else ('⚠ Не настроено', False)
     domain = config['domain'] if config else ('конфигурация повреждена' if installation == 'broken' else 'не настроен')
     ports = (f"VPN {config.get('vpn_port') or '?'} · HTTP {config['challenge_port']} · HTTPS {app.target(config)}" if config else 'не настроены')
-    rows = [('Сервер', _server()), ('Caddy', caddy), ('Домен', domain), ('Порты', ports),
-            ('SSL', certificate), ('HTTPS', https), ('Продление', renewal), ('Сайт', _site(app))]
+    rows = [('Сервер', 'Caddy · ' + caddy), ('Домен', domain), ('Порты', ports),
+            ('SSL', certificate), ('HTTPS', https), ('Продление', renewal), ('Заглушка', _site(app))]
     if installation == 'none':
         hint = 'Начните с установки: понадобятся домен и три порта.'
     elif installation == 'broken':

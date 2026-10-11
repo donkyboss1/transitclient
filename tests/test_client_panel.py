@@ -65,14 +65,34 @@ def test_snapshot_rows_and_no_network_or_full_diagnostics(panel, app, monkeypatc
     monkeypatch.setattr(panel.subprocess, 'run', docker_runner(calls))
     app.diagnostic_module = app.verify_served = app.recover = lambda *args: pytest.fail('panel must not invoke lifecycle')
     value = panel.snapshot(app)
-    assert [label for label, _ in value['rows']] == ['Сервер', 'Caddy', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Сайт']
+    assert [label for label, _ in value['rows']] == ['Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка']
     assert value['config'] == app.safe_config()
     assert value['installation'] == 'configured'
-    assert '✅ Работает' in rows(value)['Caddy']
+    assert '✅ Работает' in rows(value)['Сервер']
     assert '443' in rows(value)['Порты'] and '8080' in rows(value)['Порты'] and '9443' in rows(value)['Порты']
     assert 'самопровер' in rows(value)['HTTPS'].lower()
-    assert '✅ Таймер включён' in rows(value)['Продление'] and 'следующий:' in rows(value)['Продление']
+    assert '✅ Включено' in rows(value)['Продление'] and 'следующий:' in rows(value)['Продление']
     assert not any(word in ' '.join(args) for args, _ in calls for word in ('pull', 'restart', 'openssl', 'curl', 'enable', 'acme'))
+
+
+def test_header_describes_web_server_without_reading_hostname_or_os(panel, app, monkeypatch):
+    import platform
+    def forbidden():
+        pytest.fail('The header must not read host identity or OS')
+    monkeypatch.setattr(platform, 'node', forbidden)
+    monkeypatch.setattr(platform, 'freedesktop_os_release', forbidden)
+    monkeypatch.setattr(platform, 'system', forbidden)
+    monkeypatch.setattr(platform, 'release', forbidden)
+    monkeypatch.setattr(panel.subprocess, 'run', docker_runner([]))
+    assert rows(panel.snapshot(app))['Сервер'] == 'Caddy · ✅ Работает'
+
+
+@pytest.mark.parametrize('name,expected', [('☁️FileCloud', '☁️ FileCloud'),
+                                        ('☁️ FileCloud', '☁️ FileCloud'),
+                                        ('☁FileCloud', '☁ FileCloud')])
+def test_placeholder_name_has_space_after_icon(panel, app, name, expected):
+    (app.STATE / 'site-template.json').write_text(json.dumps(dict(name=name)))
+    assert rows(panel.snapshot(app))['Заглушка'] == expected
 
 
 @pytest.mark.parametrize('kind,expected', [('none', 'none'), ('artifacts', 'incomplete'), ('bad', 'broken'), ('missing-cert', 'incomplete')])
@@ -110,18 +130,18 @@ def test_context_precedence_and_foreign_container_rejected(panel, app, monkeypat
     ps = next(args for args, _ in calls if args[:2] == ['docker', 'ps'])
     assert 'label=org.transitclient.install-id=' + 'a' * 32 in ps
     assert 'label=com.docker.compose.service=caddy' in ps
-    assert 'не подтверждён' in rows(value)['Caddy']
+    assert 'не подтверждён' in rows(value)['Сервер']
 
 
 @pytest.mark.parametrize('state,label', [('running', 'работает'), ('exited', 'остановлен'), ('restarting', 'перезапускается'), ('paused', 'неизвестно')])
 def test_owned_caddy_states(panel, app, monkeypatch, state, label):
     monkeypatch.setattr(panel.subprocess, 'run', docker_runner([], state=state))
-    assert label in rows(panel.snapshot(app))['Caddy'].lower()
+    assert label in rows(panel.snapshot(app))['Сервер'].lower()
 
 
 def test_missing_caddy(panel, app, monkeypatch):
     monkeypatch.setattr(panel.subprocess, 'run', docker_runner([], ids=''))
-    assert 'не найден' in rows(panel.snapshot(app))['Caddy'].lower()
+    assert 'не найден' in rows(panel.snapshot(app))['Сервер'].lower()
 
 
 def test_total_subprocess_budget_is_two_seconds(panel, app, monkeypatch):
@@ -217,7 +237,7 @@ def test_pending_journal_marks_completed_files_incomplete(panel, app, monkeypatc
     (app.STATE / journal).write_text('{}')
     value = panel.snapshot(app)
     assert value['installation'] == 'incomplete'
-    assert 'установка не завершена' in rows(value)['Caddy']
+    assert 'установка не завершена' in rows(value)['Сервер']
     assert 'не завершена' in value['hint']
 
 
@@ -231,8 +251,8 @@ def test_ufw_preparation_status(panel, app, preparation, expected):
 @pytest.mark.parametrize('timer,label', [
     (None, '⚠ Неизвестно'),
     ('UnitFileState=enabled\nActiveState=active\nNextElapseUSecRealtime=SECRET\n', 'следующий запуск неизвестен'),
-    ('UnitFileState=disabled\nActiveState=active\nNextElapseUSecRealtime=Sun 2026-10-11 05:00:00 UTC\n', '⏹ Таймер выключен'),
-    ('UnitFileState=enabled\nActiveState=inactive\n', '⏹ Таймер выключен'),
+    ('UnitFileState=disabled\nActiveState=active\nNextElapseUSecRealtime=Sun 2026-10-11 05:00:00 UTC\n', '⏹ Выключено'),
+    ('UnitFileState=enabled\nActiveState=inactive\n', '⏹ Выключено'),
     ('UnitFileState=SECRET\nActiveState=SECRET\n', '⚠ Неизвестно'),
 ])
 def test_timer_disabled_and_unknown_are_distinct(panel, app, monkeypatch, timer, label):
@@ -265,7 +285,7 @@ def test_stalled_docker_leaves_timer_budget(panel, app, monkeypatch):
     monkeypatch.setattr(panel.subprocess, 'run', run)
     value = panel.snapshot(app)
     assert calls[-1][0] == 'systemctl'
-    assert '✅ Таймер включён' in rows(value)['Продление']
+    assert '✅ Включено' in rows(value)['Продление']
 
 
 def test_remaining_budget_limits_last_timeout(panel, monkeypatch):

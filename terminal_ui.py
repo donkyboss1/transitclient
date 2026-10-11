@@ -11,8 +11,27 @@ import client_panel
 
 def clean(value):
     text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', str(value))
-    return ''.join(char for char in text
+    text = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', text)
+    text = ''.join(char for char in text
                    if not unicodedata.category(char).startswith('C') or char == '\u200d')
+    groups = list(clusters(text))
+    result = ''
+    skip_spaces = False
+    for index, group in enumerate(groups):
+        if skip_spaces and group.isspace():
+            continue
+        skip_spaces = False
+        emoji = ('\ufe0f' in group or any('\U0001f000' <= char <= '\U0001faff'
+                 or '\u2600' <= char <= '\u27bf' for char in group))
+        if result and not result[-1].isspace() and emoji:
+            result += ' '
+        result += group
+        if emoji and index + 1 < len(groups):
+            # Some SSH fonts draw VS16 emoji wider than the grid cell. Leave a
+            # real two-space gap, independent of ANSI and idempotent on redraw.
+            result += '  '
+            skip_spaces = True
+    return result
 
 
 def clusters(value):
@@ -60,9 +79,30 @@ def fit(value, width):
     return result + ('…' if width else '')
 
 
+def fit_fragments(fragments, width):
+    """Clip plain graphemes with their roles, before any ANSI is generated."""
+    prepared = [(clean(value), role) for value, role in fragments]
+    truncated = sum(display_width(value) for value, _ in prepared) > width
+    budget = max(0, width - int(truncated))
+    result, used = [], 0
+    for value, role in prepared:
+        portion = ''
+        for group in clusters(value):
+            size = cluster_width(group)
+            if used + size > budget:
+                if width:
+                    portion += '…'
+                result.append((portion, role))
+                return result
+            portion += group
+            used += size
+        result.append((portion, role))
+    return result
+
+
 class Terminal:
-    palette = {'heading': '36', 'label': '90', 'value': '37', 'success': '32',
-               'warning': '33', 'error': '31'}
+    palette = {'heading': '1;36', 'bold': '1', 'domain': '1;36', 'label': None,
+               'value': None, 'success': '32', 'warning': '33', 'error': '31'}
 
     def __init__(self, no_color=False):
         self.controls = (sys.stdin.isatty() and sys.stdout.isatty()
@@ -76,21 +116,41 @@ class Terminal:
             print('\x1b[2J\x1b[H', end='', flush=True)
 
     def line(self, value='', role='value'):
-        text = fit(value, self.width)
-        if self.colors and text:
-            text = '\x1b[' + self.palette[role] + 'm' + text + '\x1b[0m'
-        print(text)
+        self.fragments([(value, role)])
+
+    def fragments(self, values):
+        parts = []
+        for value, role in fit_fragments(values, self.width):
+            code = self.palette.get(role)
+            parts.append('\x1b[' + code + 'm' + value + '\x1b[0m'
+                         if self.colors and code and value else value)
+        print(''.join(parts))
 
 
 GROUPS = [
-    ('🔧 Установка и настройки', [('1', '🚀 Установка'), ('2', '⚙️ Настройки')]),
-    ('📊 Состояние и проверки', [('3', '📊 Статус'), ('4', '🔍 Диагностика'), ('9', '🧪 Самопроверка')]),
-    ('🎨 Сайт и подключение', [('10', '🎨 Сайт-заглушка'), ('7', '📖 Инструкция подключения')]),
-    ('🔐 Обслуживание', [('5', '🔐 Проверить продление'), ('6', '🔄 Обновить'), ('8', '🗑️ Удаление')])]
-OPERATIONS = {'1': 'install', '3': 'status', '4': 'diagnose', '5': 'renew',
-              '6': 'update', '7': 'guide', '8': 'uninstall'}
+    ('🔧 Установка и настройки', [('1', '🚀 Установка', 'install'), ('2', '⚙️ Настройки', 'settings')]),
+    ('📊 Состояние и проверки', [('3', '📊 Статус', 'status'), ('4', '🔍 Диагностика', 'diagnose'), ('5', '🧪 Самопроверка', 'tests')]),
+    ('🎨 Сайт и подключение', [('6', '🎨 Сайт-заглушка', 'sites'), ('7', '📖 Инструкция подключения', 'guide')]),
+    ('🔐 Обслуживание', [('8', '🔐 Проверить продление', 'renew'), ('9', '🔄 Обновить', 'update'), ('10', '🗑️ Удаление', 'uninstall')])]
+MENU = {number: (label, action) for _, options in GROUPS for number, label, action in options}
+OPERATIONS = {number: action for number, (_, action) in MENU.items() if action not in ('settings', 'tests', 'sites')}
+COMPACT_LABELS = {'guide': '📖 Подключение', 'renew': '🔐 Продление'}
 TITLES = {'settings': '⚙️ Настройки', 'advanced': '⚙️ Дополнительные настройки',
           'tests': '🧪 Самопроверка', 'sites': '🎨 Сайт-заглушка'}
+
+
+def option(number, label):
+    return [(' ', None), (str(number).rjust(2), 'bold'), (') ', None), (label, None)]
+
+
+def columns(terminal, options):
+    half = max(1, (terminal.width - 1) // 2)
+    for offset in range(0, len(options), 2):
+        left = fit_fragments(option(*options[offset]), half)
+        if offset + 1 < len(options):
+            padding = half - sum(display_width(value) for value, _ in left) + 1
+            left += [(' ' * padding, None)] + fit_fragments(option(*options[offset + 1]), terminal.width - half - 1)
+        terminal.fragments(left)
 
 
 def draw(terminal, app, screen, notice=''):
@@ -106,46 +166,38 @@ def draw(terminal, app, screen, notice=''):
     if compact and screen == 'sites':
         rows = [row for row in rows if row[0] != 'Продление']
     if terminal.height < 18:
-        rows = [row for row in rows if row[0] in ('Сервер', 'Caddy', 'SSL', 'HTTPS')]
+        rows = [row for row in rows if row[0] in ('Сервер', 'Домен', 'SSL', 'HTTPS')]
     for label, value in rows:
-        role = 'error' if '❌' in value else 'warning' if '⚠' in value else 'success' if '✅' in value else 'value'
-        text = label + ': ' if compact else label + ':' + ' ' * max(1, 14 - display_width(label + ':'))
-        terminal.line(text + value, role)
+        padding = ' ' if compact else ' ' * max(1, 14 - display_width(label + ':'))
+        terminal.fragments([(label + ':', 'bold'), (padding, None), (value, 'domain' if label == 'Домен' else None)])
     terminal.line('─' * min(60, terminal.width), 'label')
     config = panel.get('config')
     if screen == 'main':
         if compact:
-            options = [('1', 'Установка'), ('2', 'Настройки'), ('3', 'Статус'),
-                       ('4', 'Диагностика'), ('9', 'Самопроверка'), ('10', 'Сайт-заглушка'),
-                       ('7', 'Подключение'), ('5', 'Продление'), ('6', 'Обновить'),
-                       ('8', 'Удаление'), ('0', 'Выход')]
-            half = max(1, (terminal.width - 1) // 2)
-            for offset in range(0, len(options), 2):
-                left = fit(options[offset][0] + ') ' + options[offset][1], half)
-                right = '' if offset + 1 == len(options) else options[offset + 1][0] + ') ' + options[offset + 1][1]
-                terminal.line(left + ' ' * (half - display_width(left) + 1) + right)
+            columns(terminal, [(number, COMPACT_LABELS.get(action, label)) for number, (label, action) in MENU.items()]
+                    + [('0', '⬅️ Выход')])
         else:
             for heading, options in GROUPS:
-                terminal.line(heading, 'heading')
-                for number, label in options:
-                    terminal.line(f' {number:>2}) {label}')
+                terminal.line(heading, 'bold')
+                for number, label, _ in options:
+                    terminal.fragments(option(number, label))
                 terminal.line()
-            terminal.line('  0) ⬅️ Выход')
+            terminal.fragments(option('0', '⬅️ Выход'))
             terminal.line()
         terminal.line(notice or 'Подсказка: ' + panel['hint'], 'warning' if notice else 'label')
     else:
-        terminal.line(TITLES[screen], 'heading')
+        terminal.line(TITLES[screen], 'bold')
         if screen == 'settings':
             for number, key, label in [('1', 'challenge_port', 'HTTP-порт'), ('2', 'vpn_port', 'VPN-порт'),
                                         ('3', 'local_port', 'Локальный HTTPS-порт')]:
-                terminal.line(f"  {number}) {label}: {(config or {}).get(key) or 'неизвестно'}")
-            terminal.line('  4) Дополнительные настройки')
+                terminal.fragments(option(number, f"{label}: {(config or {}).get(key) or 'неизвестно'}"))
+            terminal.fragments(option('4', 'Дополнительные настройки'))
         elif screen == 'advanced':
-            terminal.line('  1) Docker-сеть: ' + ((config or {}).get('docker_network') or 'host / loopback'))
+            terminal.fragments(option('1', 'Docker-сеть: ' + ((config or {}).get('docker_network') or 'host / loopback')))
         elif screen == 'tests':
-            terminal.line('  1) Локальная HTTPS — без изменений')
-            terminal.line('  2) HTTP через релей — временный тест')
-            terminal.line('  3) Из контейнера ноды — без изменений')
+            terminal.fragments(option('1', 'Локальная HTTPS — без изменений'))
+            terminal.fragments(option('2', 'HTTP через релей — временный тест'))
+            terminal.fragments(option('3', 'Из контейнера ноды — без изменений'))
         elif screen == 'sites':
             try:
                 themes = app.template_module().catalog(app.PACKAGE)['templates']
@@ -153,16 +205,12 @@ def draw(terminal, app, screen, notice=''):
                 themes = []
                 terminal.line('Каталог недоступен → Диагностика (4).', 'error')
             if compact:
-                half = max(1, (terminal.width - 1) // 2)
-                for offset in range(0, len(themes), 2):
-                    left = fit(themes[offset]['id'] + ') ' + themes[offset]['name'], half)
-                    right = '' if offset + 1 == len(themes) else themes[offset + 1]['id'] + ') ' + themes[offset + 1]['name']
-                    terminal.line(left + ' ' * (half - display_width(left) + 1) + right)
+                columns(terminal, [(theme['id'], theme['name']) for theme in themes])
             else:
                 for theme in themes:
-                    terminal.line(f" {theme['id']:>2}) {theme['name']}")
-            terminal.line('  r) Случайный · i) Встроенный · b) Откат')
-        terminal.line('  0) ⬅️ Назад')
+                    terminal.fragments(option(theme['id'], theme['name']))
+            terminal.fragments(option('r', 'Случайный') + [(' · ', None), ('i', 'bold'), (') Встроенный · ', None), ('b', 'bold'), (') Откат', None)])
+        terminal.fragments(option('0', '⬅️ Назад'))
         if notice:
             terminal.line(notice, 'warning')
     return panel
@@ -198,7 +246,8 @@ def run(app, args):
             if choice == '0':
                 stack.pop()
                 continue
-            destination = {'2': 'settings', '9': 'tests', '10': 'sites'}.get(choice) if screen == 'main' else None
+            action = MENU.get(choice, (None, None))[1] if screen == 'main' else None
+            destination = action if action in ('settings', 'tests', 'sites') else None
             if screen == 'settings' and choice == '4':
                 destination = 'advanced'
             if destination:
@@ -224,8 +273,7 @@ def run(app, args):
                 continue
             try:
                 terminal.clear()
-                draw_title = TITLES.get(screen) or next(label for _, options in GROUPS
-                                                       for number, label in options if number == choice)
+                draw_title = TITLES.get(screen) or MENU[choice][0]
                 terminal.line('🚀 Transit Client · ' + draw_title, 'heading')
                 app.perform(selected)
                 input('Нажмите Enter для возврата…')

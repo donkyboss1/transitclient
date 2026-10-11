@@ -87,11 +87,11 @@ def child(scenario, no_color):
         app.safe_config = lambda: dict(config)
         state = 'Установка не завершена' if scenario == 'incomplete' else 'Работает'
         docker = 'Docker недоступен · неизвестно' if scenario == 'docker' else state
-        rows = [('Сервер', 'pty-host · Ubuntu 26.04'), ('Caddy', docker),
+        rows = [('Сервер', 'Caddy · ' + docker),
                 ('Домен', config['domain']), ('Порты', 'VPN 443 · HTTP 8080 · HTTPS 127.0.0.1:9443'),
                 ('SSL', 'Действителен на диске · 30 дней · Test issuer'),
                 ('HTTPS', 'Не подтверждён · Самопроверка'),
-                ('Продление', 'Таймер включён · следующий запуск завтра'), ('Сайт', 'Тестовый сайт')]
+                ('Продление', 'Включено · следующий запуск завтра'), ('Заглушка', '☁️Тестовый сайт')]
         client_panel.snapshot = lambda *a, **k: dict(rows=rows, hint='HTTPS не подтверждён → Самопроверка',
                                                     config=dict(config), installation=state)
 
@@ -225,7 +225,7 @@ class Session:
 
 
 def back_and_cancel():
-    for option, title in [('2', 'Настройки'), ('9', 'Самопроверка'), ('10', 'Сайт')]:
+    for option, title in [('2', 'Настройки'), ('5', 'Самопроверка'), ('6', 'Сайт')]:
         with Session() as session:
             session.send(option + '\n')
             session.expect(title)
@@ -261,7 +261,7 @@ def invalid_and_results():
             session.expect(PROMPT)
         session.send('0\n')
         session.finish()
-    for menu in ('2', '9', '10'):
+    for menu in ('2', '5', '6'):
         with Session() as session:
             session.send(menu + '\n')
             session.expect(PROMPT)
@@ -277,9 +277,21 @@ def invalid_and_results():
             session.finish()
 
 
+def sequential_main_actions():
+    with Session() as session:
+        for option, command in [('3', 'status'), ('7', 'guide'), ('8', 'renew'), ('9', 'update'), ('10', 'uninstall')]:
+            session.send(option + '\n')
+            session.expect('TEST_SUCCESS=' + command)
+            session.expect(PAUSE)
+            session.send('\n')
+            session.expect(PROMPT)
+        session.send('0\n')
+        session.finish()
+
+
 def operation_modes():
     with Session() as session:
-        session.send('9\n')
+        session.send('5\n')
         session.expect(PROMPT)
         for option, marker in [('1', 'local'), ('2', 'http01'), ('3', 'vpn')]:
             session.send(option + '\n')
@@ -289,7 +301,7 @@ def operation_modes():
             session.expect(PROMPT)
         session.send('0\n')
         session.expect(PROMPT)
-        session.send('10\n')
+        session.send('6\n')
         session.expect(PROMPT)
         assert '11' in session.output
         for option, marker in [('i', 'builtin'), ('r', 'random'), ('b', 'rollback')]:
@@ -332,7 +344,7 @@ def input_cancel_and_operation_interrupt():
         session.send('0\n')
         session.finish()
     with Session('interrupt-operation') as session:
-        session.send('5\n')
+        session.send('8\n')
         session.expect('OPERATION_RUNNING')
         session.send('\x03')
         session.expect('ROLLBACK_FINISHED')
@@ -343,7 +355,7 @@ def input_cancel_and_operation_interrupt():
 
 
 def eof_at_every_level():
-    for path in ([], ['2'], ['9'], ['10'], ['2', '1'], ['3'], ['1']):
+    for path in ([], ['2'], ['5'], ['6'], ['2', '1'], ['3'], ['1']):
         with Session() as session:
             for index, option in enumerate(path):
                 session.send(option + '\n')
@@ -378,7 +390,7 @@ def terminal_capabilities_and_layout():
                    {'env': {'NO_COLOR': '1'}}, {'env': {'TERM': 'dumb'}}):
         with Session(**kwargs) as session:
             for _ in range(2):
-                session.send('9\n')
+                session.send('5\n')
                 session.expect(PROMPT)
                 session.send('0\n')
                 session.expect(PROMPT)
@@ -398,6 +410,18 @@ def terminal_capabilities_and_layout():
                     assert line_width(line) <= kwargs.get('columns', 80), repr(line)
                 for number in ('1)', '2)', '3)', '4)', '5)', '6)', '7)', '8)', '9)', '10)', '0)'):
                     assert number in screen, screen
+                options = [line for line in screen.splitlines() if re.match(r'^\s*\d+\)', line)]
+                assert re.findall(r'\b(\d+)\)', '\n'.join(options)) == [str(i) for i in range(1, 11)] + ['0'], options
+                assert 'pty-host' not in screen and 'Ubuntu' not in screen, screen
+                assert 'Сервер:' in screen and 'Caddy ·' in screen and 'Заглушка:' in screen, screen
+                assert 'Таймер включён' not in screen and 'Включено' in screen, screen
+                assert '☁️  Тестовый сайт' in screen, screen
+                if not kwargs.get('no_color') and not kwargs.get('env', {}).get('NO_COLOR'):
+                    raw_screen = output.rsplit('\x1b[2J', 1)[1]
+                    for label in ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка'):
+                        assert '\x1b[1m' + label + ':\x1b[0m' in raw_screen, raw_screen
+                    assert '\x1b[1;36mnode.example.com\x1b[0m' in raw_screen, raw_screen
+                    assert '\x1b[32m' not in raw_screen and '\x1b[31m' not in raw_screen, raw_screen
             if kwargs.get('no_color') or kwargs.get('env', {}).get('NO_COLOR'):
                 assert not SGR.search(output), 'Color emitted with no-color'
     for scenario, marker in [('incomplete', 'Установка не завершена'), ('docker', 'Docker недоступен')]:
@@ -440,7 +464,7 @@ def main():
         return
     if os.name != 'posix':
         parser.error('Run in Linux/WSL: python3 tests/pty_menu_check.py')
-    checks = [back_and_cancel, invalid_and_results, operation_modes,
+    checks = [back_and_cancel, invalid_and_results, sequential_main_actions, operation_modes,
               input_cancel_and_operation_interrupt, eof_at_every_level,
               confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output]
     for check in checks:

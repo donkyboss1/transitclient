@@ -25,11 +25,11 @@ def ui(monkeypatch):
     import terminal_ui
     import client_panel
     monkeypatch.setattr(client_panel, 'snapshot', lambda _: {
-        'rows': [('Сервер', 'node · Ubuntu 26.04'), ('Caddy', '✅ Работает'),
+        'rows': [('Сервер', 'Caddy · ✅ Работает'),
                  ('Домен', 'example.com'), ('Порты', 'VPN 443 · HTTP 8080 · HTTPS 127.0.0.1:9443'),
                  ('SSL', '✅ Действителен · 25 дней · issuer'), ('HTTPS', 'Не подтверждён'),
-                 ('Продление', '✅ Таймер включён'), ('Сайт', 'Встроенная страница')],
-        'hint': 'HTTPS не подтверждён → Самопроверка (9).',
+                 ('Продление', '✅ Включено'), ('Заглушка', 'Встроенная страница')],
+        'hint': 'HTTPS не подтверждён → Самопроверка (5).',
         'config': {'domain': 'example.com', 'challenge_port': 8080, 'vpn_port': 443,
                    'local_port': 9443}})
     monkeypatch.setattr(sys, 'stdin', type('TTY', (), {'isatty': lambda _: True})())
@@ -51,7 +51,7 @@ def inputs(monkeypatch, values):
     monkeypatch.setattr('builtins.input', read)
 
 
-@pytest.mark.parametrize('submenu', ['2', '9', '10'])
+@pytest.mark.parametrize('submenu', ['2', '5', '6'])
 def test_view_and_back_never_perform(app, ui, monkeypatch, submenu):
     monkeypatch.setattr(app, 'perform', lambda _: pytest.fail('Browsing cannot perform'))
     inputs(monkeypatch, [submenu, '0', '0'])
@@ -68,15 +68,15 @@ def test_nested_settings_and_cancel_return_one_level(app, ui, monkeypatch, capsy
 def test_invalid_and_empty_remain_on_screen(app, ui, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(app, 'perform', lambda selected: calls.append(selected.command) or 0)
-    inputs(monkeypatch, ['', 'bad', '9', '', 'bad', '0', '0'])
+    inputs(monkeypatch, ['', 'bad', '5', '', 'bad', '0', '0'])
     ui.run(app, args())
     assert calls == []
     assert capsys.readouterr().out.count('Неизвестный пункт') == 4
 
 
 @pytest.mark.parametrize('sequence', [
-    [EOFError()], ['2', EOFError()], ['9', '1', EOFError()],
-    ['3', EOFError()], ['10', EOFError()]])
+    [EOFError()], ['2', EOFError()], ['5', '1', EOFError()],
+    ['3', EOFError()], ['6', EOFError()]])
 def test_eof_exits_once(app, ui, monkeypatch, sequence):
     monkeypatch.setattr(app, 'perform', lambda _: 0)
     inputs(monkeypatch, sequence)
@@ -113,7 +113,7 @@ def test_operation_interrupt_finishes_cleanup_then_returns_parent(app, ui, monke
 def test_site_aliases_do_not_change_cli_mapping(app, ui, monkeypatch):
     choices = []
     monkeypatch.setattr(app, 'perform', lambda selected: choices.append(selected.template) or 0)
-    inputs(monkeypatch, ['10', 'i', '', 'r', '', 'b', '', '11', '', '0', '0'])
+    inputs(monkeypatch, ['6', 'i', '', 'r', '', 'b', '', '11', '', '0', '0'])
     ui.run(app, args())
     assert choices == ['builtin', 'random', 'rollback', '11']
     assert app.select_template('0') == 'builtin'
@@ -123,7 +123,7 @@ def test_selftest_flags_are_isolated(app, ui, monkeypatch):
     choices = []
     monkeypatch.setattr(app, 'perform', lambda selected:
                         choices.append((selected.command, selected.http01, selected.vpn)) or 0)
-    inputs(monkeypatch, ['9', '2', '', '3', '', '1', '', '0', '3', '', '0'])
+    inputs(monkeypatch, ['5', '2', '', '3', '', '1', '', '0', '3', '', '0'])
     ui.run(app, args())
     assert choices == [('self-test', True, False), ('self-test', False, True),
                        ('self-test', False, False), ('status', False, False)]
@@ -137,7 +137,7 @@ def test_many_transitions_use_constant_call_depth(app, ui, monkeypatch):
             frame, depth = frame.f_back, depth + 1
         depths.append(depth)
         return next(answers)
-    answers = iter(['2', '0', '9', '0', '10', '0'] * 50 + ['0'])
+    answers = iter(['2', '0', '5', '0', '6', '0'] * 50 + ['0'])
     monkeypatch.setattr('builtins.input', read)
     monkeypatch.setattr(app, 'perform', lambda _: pytest.fail('Browsing must not mutate'))
     assert ui.run(app, args()) == 0
@@ -181,7 +181,7 @@ def test_terminal_capabilities(ui, monkeypatch, environment, no_color, colors, c
     terminal.line('Название', 'heading')
     text = output.getvalue()
     assert ('\x1b[2J\x1b[H' in text) == clear
-    assert ('\x1b[36m' in text) == colors
+    assert ('\x1b[1;36m' in text) == colors
     assert '\x1b[3J' not in text
 
 
@@ -223,3 +223,67 @@ def test_confirmation_preserves_interrupt_signal(app, monkeypatch, error):
     inputs(monkeypatch, [error])
     with pytest.raises(type(error)):
         app.confirm('Подтвердить?')
+
+
+@pytest.mark.parametrize('choice,command', [('1', 'install'), ('3', 'status'), ('4', 'diagnose'),
+                                          ('7', 'guide'), ('8', 'renew'), ('9', 'update'), ('10', 'uninstall')])
+def test_main_number_dispatch_matches_visual_order(app, ui, monkeypatch, choice, command):
+    called = []
+    monkeypatch.setattr(app, 'perform', lambda selected: called.append(selected.command) or 0)
+    inputs(monkeypatch, [choice, '', '0'])
+    ui.run(app, args())
+    assert called == [command]
+
+
+@pytest.mark.parametrize('size', [(80, 40), (48, 20)])
+def test_main_menu_numbers_are_sequential_in_row_major_order(app, ui, monkeypatch, size):
+    import re
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda *_: size)
+    ui.draw(ui.Terminal(no_color=True), app, 'main')
+    text = output.getvalue()
+    option_lines = [line for line in text.splitlines() if re.search(r'\b\d+\)', line)]
+    option_lines = [line for line in option_lines if re.match(r'^\s*\d+\)', line)]
+    assert re.findall(r'\b(\d+)\)', '\n'.join(option_lines)) == [str(number) for number in range(1, 11)] + ['0']
+    assert all(line[:4].endswith(')') for line in option_lines)
+
+
+def test_summary_fragment_styles_keep_values_neutral_and_domain_bold_cyan(app, ui, monkeypatch):
+    import re
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'xterm-256color')
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    ui.draw(ui.Terminal(), app, 'main')
+    text = output.getvalue()
+    for label in ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка'):
+        assert '\x1b[1m' + label + ':\x1b[0m' in text
+    assert '\x1b[1;36mexample.com\x1b[0m' in text
+    assert '\x1b[32m' not in text and '\x1b[33m' not in text and '\x1b[31m' not in text
+    assert 'node · Ubuntu' not in text
+    for heading, _ in ui.GROUPS:
+        assert '\x1b[1m' + ui.clean(heading) + '\x1b[0m' in text
+    assert re.search(r'\x1b\[1m\s*10\x1b\[0m\)', text)
+
+
+@pytest.mark.parametrize('value,expected', [('⚙️Настройки', '⚙️  Настройки'), ('🗑️Удаление', '🗑️  Удаление'),
+                                           ('☁️Облако', '☁️  Облако'), ('Текст✅Готово', 'Текст ✅  Готово')])
+def test_emoji_always_has_text_separator(ui, value, expected):
+    assert ui.clean(value) == expected
+    assert ui.clean(ui.clean(value)) == expected
+
+
+def test_fragment_clipping_preserves_bold_and_cyan_without_overflow(ui, monkeypatch):
+    import re
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    terminal = ui.Terminal()
+    terminal.width = 20
+    terminal.fragments([('Домен:', 'bold'), (' ', None), ('very-long-domain.example.com', 'domain')])
+    text = output.getvalue().rstrip('\n')
+    assert text.startswith('\x1b[1mДомен:\x1b[0m ')
+    assert '\x1b[1;36m' in text and text.endswith('…\x1b[0m')
+    assert ui.display_width(re.sub(r'\x1b\[[0-9;]*m', '', text)) == 20

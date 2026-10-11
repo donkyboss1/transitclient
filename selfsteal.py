@@ -887,27 +887,31 @@ def recover_configuration():
 
 def configure(config, choice=None):
     if choice is None:
-        print('⚙️ Настройка: 1 HTTP-порт · 2 VPN-порт · 3 HTTPS-порт · 4 Docker-сеть · 0 назад')
+        print('⚙️ Настройки: 1 HTTP-порт для сертификата · 2 Порт для проксирования трафика · '
+              '3 Локальный HTTPS-порт веб-сервера · 4 Docker-сеть · 0 назад')
         choice = input('Выберите настройку: ').strip()
     candidate = dict(config)
     if choice == '0':
         return config
     if choice == '1':
-        print(f"Сейчас HTTP: {config['challenge_port']}. Сначала измените порт в боте.")
-        candidate['challenge_port'] = port_value(input('Новый согласованный HTTP-порт: '))
+        print(f"HTTP-порт для выпуска и продления сертификата: {config['challenge_port']}.")
+        print('Сначала измените этот порт в боте и дождитесь готовности маршрута.')
+        candidate['challenge_port'] = port_value(input('Новый HTTP-порт для сертификата: '))
         validate_config(candidate)
         check_challenge_port(candidate)
     elif choice == '2':
-        candidate['vpn_port'] = input('VPN inbound [443]: ').strip() or '443'
+        print('Порт VPN-ноды на вашем сервере, куда транзит направляет клиентский трафик.')
+        candidate['vpn_port'] = input('Порт для проксирования трафика [443]: ').strip() or '443'
         validate_config(candidate)
         diagnostic_module().display(diagnostic_module().collect(candidate))
     elif choice == '3':
-        candidate['local_port'] = port_value(input('Новый локальный HTTPS-порт: '))
+        candidate['local_port'] = port_value(input('Новый локальный HTTPS-порт веб-сервера: '))
         validate_config(candidate)
         if not candidate.get('docker_network') and not free_port(candidate['local_port'], '127.0.0.1'):
             raise Failure('Выбранный HTTPS-порт занят. Чужой процесс не остановлен.', 'HTTPS_PORT_BUSY')
         print('VPN target необходимо изменить самостоятельно после применения.')
     elif choice == '4':
+        print('Docker-сеть определяет, как VPN-нода достигает локального Caddy.')
         print('Пустое имя — host networking. Bridge — существующая user-defined Docker-сеть.')
         candidate['docker_network'] = input('Имя сети: ').strip()
         candidate['vpn_container'] = input('VPN-контейнер (необязательно): ').strip()
@@ -917,8 +921,8 @@ def configure(config, choice=None):
             raise Failure('HTTPS-порт host занят. Измените его перед переключением.', 'HTTPS_PORT_BUSY')
     else:
         raise Failure('Неизвестная настройка.', 'INVALID_OPTION')
-    labels = {'challenge_port': 'HTTP-порт', 'vpn_port': 'VPN-порт',
-              'local_port': 'Локальный HTTPS-порт', 'docker_network': 'Docker-сеть',
+    labels = {'challenge_port': 'HTTP-порт для сертификата', 'vpn_port': 'Порт для проксирования трафика',
+              'local_port': 'Локальный HTTPS-порт веб-сервера', 'docker_network': 'Docker-сеть',
               'vpn_container': 'Контейнер ноды'}
     for key, label in labels.items():
         if config.get(key) != candidate.get(key):
@@ -952,6 +956,9 @@ def configure(config, choice=None):
 
 
 def renew(config):
+    print('🔐 Проверяем срок сертификата и расписание продления.')
+    print('Если продление ещё не требуется, новый сертификат не запрашивается; '
+          'если требуется — выполняется выпуск и применение в Caddy.')
     check_dns(config)
     home = STATE / 'acme'
     home.mkdir(exist_ok=True, mode=0o700)
@@ -988,6 +995,8 @@ def renew(config):
             raise Failure('ACME-проверка не завершена. Проверьте маршрут в боте, '
                           'DNS и входящий проверочный порт в firewall/NAT. '
                           'Прежний сертификат сохранён; повтор через таймер.')
+        if result.returncode == 2:
+            print('Срок продления ещё не наступил. Используется имеющийся сертификат.')
         chain = domain_dir / 'fullchain.cer'
         key = domain_dir / (config['domain'] + '.key')
         if not chain.exists() or not key.exists():
@@ -1002,7 +1011,7 @@ def renew(config):
                                               'renewal_due': False, 'staging': config['ca'] == STAGING})
         label = 'STAGING: тестовая цепочка, НЕ публичное доверие' if config['ca'] == STAGING else "Let's Encrypt: доверенная цепочка"
         print(f"{label}; Caddy проверен с SNI {config['domain']} на {target(config)}.")
-        print('Теперь настройте VPN-ноду и нажмите в боте «Готово, проверить backend».')
+        print('✅ Проверка продления завершена.')
     finally:
         abort_acme()
 
@@ -1080,10 +1089,10 @@ def ask(label, default=''):
 def interactive_config(args):
     print('⚙️ Настройка')
     config = {'domain': ask('Домен из бота', getattr(args, 'domain', None) or ''),
-              'vpn_port': ask('VPN-порт', getattr(args, 'vpn_port', None) or 443),
-              'challenge_port': ask('HTTP-порт из бота', getattr(args, 'challenge_port', None) or 8080),
+              'vpn_port': ask('Порт для проксирования трафика', getattr(args, 'vpn_port', None) or 443),
+              'challenge_port': ask('HTTP-порт для сертификата из бота', getattr(args, 'challenge_port', None) or 8080),
               'relay_ip': getattr(args, 'relay_ip', None) or '',
-              'local_port': ask('Локальный HTTPS-порт', getattr(args, 'local_port', None) or 9443),
+              'local_port': ask('Локальный HTTPS-порт веб-сервера', getattr(args, 'local_port', None) or 9443),
               'docker_network': getattr(args, 'docker_network', None) or '',
               'vpn_container': getattr(args, 'vpn_container', None) or '',
               'firewall': getattr(args, 'firewall', None) or 'ufw',
@@ -1367,6 +1376,7 @@ def install(args):
             verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem'))
         (STATE / 'configuration-transaction.json').unlink(missing_ok=True)
         renew(config)
+        print('Теперь настройте VPN-ноду и нажмите в боте «Готово, проверить backend».')
     except BaseException:
         if package_transaction:
             recover_update()
@@ -1703,6 +1713,7 @@ def update(config, args):
         atomic_json(CONFIG, config)
         (STATE / 'update-transaction.json').unlink()
         print('Обновление проверено; предыдущий пакет сохранён: ' + str(backup))
+        print('Для запуска меню: transitclient')
 
 
 def uninstall():

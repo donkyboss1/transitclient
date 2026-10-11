@@ -97,6 +97,18 @@ def child(scenario, no_color):
 
         def fake_perform(args):
             command = args.command
+            if scenario == 'stream-output':
+                print('✅  Готово', flush=True)
+                sys.stdout.write('☁️')
+                sys.stdout.flush()
+                sys.stdout.write('   Облако\n')
+                sys.stdout.flush()
+                print('⚠️  Ошибка', file=sys.stderr, flush=True)
+                print('PATH=/root/a  b/key.pem', flush=True)
+                input('⚙️  Введите значение: ')
+            if scenario == 'long-output':
+                for index in range(75):
+                    print('REPORT_LINE=' + str(index), flush=True)
             if command == 'install':
                 approved = app.installation_plan(config)
                 print('INSTALL_APPROVED' if approved else 'INSTALL_CANCELLED', flush=True)
@@ -104,10 +116,12 @@ def child(scenario, no_color):
                     forbidden()
                 return 0
             if scenario == 'interrupt-operation' and command == 'renew':
-                print('OPERATION_RUNNING', flush=True)
                 try:
+                    print('OPERATION_RUNNING', flush=True)
                     while True:
-                        signal.pause()
+                        # A cancellable polling wait models subprocess supervision;
+                        # pause() can miss the readiness-to-wait signal window.
+                        time.sleep(0.05)
                 finally:
                     print('ROLLBACK_FINISHED', flush=True)
             if command == 'configure':
@@ -331,15 +345,10 @@ def input_cancel_and_operation_interrupt():
         session.send('2\n')
         session.expect(PROMPT)
         session.send('4\n')
-        session.expect(PROMPT)
-        session.send('0\n')
-        session.expect(PROMPT)
-        session.send('4\n')
-        session.expect(PROMPT)
+        session.expect('CONFIG_CHOICE=4')
+        session.expect('Новое значение:')
         session.send('\x03')
         session.expect('Действие отменено')
-        session.expect(PROMPT)
-        session.send('0\n')
         session.expect(PROMPT)
         session.send('0\n')
         session.finish()
@@ -350,16 +359,17 @@ def input_cancel_and_operation_interrupt():
         session.expect('ROLLBACK_FINISHED')
         session.expect('Действие отменено')
         session.expect(PROMPT)
+        assert '\x1b[r' in session.output, 'Scroll region must reset after interrupt'
         session.send('0\n')
         session.finish()
 
 
 def eof_at_every_level():
-    for path in ([], ['2'], ['5'], ['6'], ['2', '1'], ['3'], ['1']):
+    for path in ([], ['2'], ['5'], ['6'], ['2', '1'], ['2', '4'], ['3'], ['1']):
         with Session() as session:
             for index, option in enumerate(path):
                 session.send(option + '\n')
-                if path == ['2', '1'] and index == 1:
+                if path in (['2', '1'], ['2', '4']) and index == 1:
                     session.expect('Новое значение:')
                 elif option == '3':
                     session.expect(PAUSE)
@@ -369,6 +379,8 @@ def eof_at_every_level():
                     session.expect(PROMPT)
             session.send('\x04')
             session.finish()
+            if path in (['2', '1'], ['2', '4'], ['3'], ['1']):
+                assert '\x1b[r' in session.output, 'Scroll region must reset after EOF'
 
 
 def confirmation_defaults_to_no():
@@ -415,7 +427,7 @@ def terminal_capabilities_and_layout():
                 assert 'pty-host' not in screen and 'Ubuntu' not in screen, screen
                 assert 'Сервер:' in screen and 'Caddy ·' in screen and 'Заглушка:' in screen, screen
                 assert 'Таймер включён' not in screen and 'Включено' in screen, screen
-                assert '☁️  Тестовый сайт' in screen, screen
+                assert '☁️ Тестовый сайт' in screen, screen
                 if not kwargs.get('no_color') and not kwargs.get('env', {}).get('NO_COLOR'):
                     raw_screen = output.rsplit('\x1b[2J', 1)[1]
                     for label in ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка'):
@@ -454,6 +466,97 @@ def redirected_output():
             os.close(slave)
 
 
+SUMMARY_LABELS = ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка')
+
+
+def current_screen(session):
+    return session.output.rsplit('\x1b[2J\x1b[H', 1)[-1]
+
+
+def assert_shared_header(raw, columns):
+    plain = CSI.sub('', raw).replace('\r', '')
+    found = [line.split(':', 1)[0] for line in plain.splitlines()
+             if any(line.startswith(label + ':') for label in SUMMARY_LABELS)]
+    assert found == list(SUMMARY_LABELS), plain
+    assert 'Transit Client · ' in plain and 'node.example.com' in plain, plain
+    assert all(line_width(line) <= columns for line in plain.splitlines()), plain
+    assert not re.search(r'[\U0001f300-\U0001faff\u2600-\u27bf]\ufe0f? {2,}\S', plain), plain
+
+
+def shared_headers_direct_docker_and_operation_regions():
+    for columns, lines in ((80, 40), (48, 20)):
+        with Session(columns=columns, lines=lines) as session:
+            assert_shared_header(current_screen(session), columns)
+            for option in ('2', '5', '6'):
+                session.send(option + '\n')
+                session.expect(PROMPT)
+                screen = current_screen(session)
+                assert_shared_header(screen, columns)
+                assert len(CSI.sub('', screen).replace('\r', '').splitlines()) <= lines, screen
+                session.send('0\n')
+                session.expect(PROMPT)
+            session.send('2\n')
+            session.expect(PROMPT)
+            settings = CSI.sub('', current_screen(session))
+            assert '4) Docker-сеть' in settings and 'Дополнительные' not in settings, settings
+            session.send('4\n')
+            session.expect('CONFIG_CHOICE=4')
+            session.expect('Новое значение:')
+            assert_shared_header(current_screen(session), columns)
+            session.send('\n')
+            session.expect(PAUSE)
+            session.send('\n')
+            session.expect(PROMPT)
+            assert '\x1b[r' in session.output, 'Scroll region must reset before returning to settings'
+            session.send('0\n')
+            session.expect(PROMPT)
+            for choice, marker in [('3', 'TEST_SUCCESS=status'), ('4', 'TEST_ERROR'), ('7', 'TEST_SUCCESS=guide'),
+                                   ('8', 'TEST_SUCCESS=renew'), ('9', 'TEST_SUCCESS=update'), ('10', 'TEST_SUCCESS=uninstall')]:
+                session.send(choice + '\n')
+                session.expect(marker)
+                session.expect(PAUSE)
+                raw = current_screen(session)
+                assert_shared_header(raw, columns)
+                assert re.search(r'\x1b\[\d+;\d+r', raw), 'No protected operation scroll region: ' + repr(raw)
+                begin = len(session.output)
+                session.read(0.1)
+                assert '\x1b[2J' not in session.output[begin:], 'Operation result cleared before Enter'
+                session.send('\n')
+                session.expect(PROMPT)
+                assert '\x1b[r' in session.output[begin:], 'Scroll region must reset after Enter'
+            session.send('0\n')
+            session.finish()
+
+
+def operation_stream_and_long_report():
+    for columns, lines in ((80, 40), (48, 20)):
+        with Session('stream-output', columns=columns, lines=lines) as session:
+            session.send('3\n')
+            session.expect('⚙️ Введите значение:')
+            screen = CSI.sub('', current_screen(session)).replace('\r', '')
+            assert '✅ Готово\n☁️ Облако\n⚠️ Ошибка\n' in screen, screen
+            assert 'PATH=/root/a  b/key.pem' in screen, screen
+            session.send('\n')
+            session.expect(PAUSE)
+            session.send('\n')
+            session.expect(PROMPT)
+            session.send('0\n')
+            session.finish()
+        with Session('long-output', columns=columns, lines=lines) as session:
+            session.send('3\n')
+            session.expect('REPORT_LINE=74')
+            session.expect(PAUSE)
+            raw = current_screen(session)
+            assert_shared_header(raw, columns)
+            region = re.search(r'\x1b\[(\d+);(\d+)r', raw)
+            assert region and 8 < int(region.group(1)) < int(region.group(2)) <= lines, repr(raw)
+            session.send('\x03')
+            session.expect(PROMPT)
+            assert '\x1b[r' in session.output, 'Long output cancellation left restricted scroll region'
+            session.send('0\n')
+            session.finish()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--child', help=argparse.SUPPRESS)
@@ -466,7 +569,8 @@ def main():
         parser.error('Run in Linux/WSL: python3 tests/pty_menu_check.py')
     checks = [back_and_cancel, invalid_and_results, sequential_main_actions, operation_modes,
               input_cancel_and_operation_interrupt, eof_at_every_level,
-              confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output]
+              confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output,
+              shared_headers_direct_docker_and_operation_regions, operation_stream_and_long_report]
     for check in checks:
         check()
         print('PASS ' + check.__name__, flush=True)

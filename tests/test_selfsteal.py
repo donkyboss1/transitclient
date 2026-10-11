@@ -480,6 +480,44 @@ def test_unpublished_update_has_no_network_fallback(app, config, monkeypatch):
         app.update(config, args)
 
 
+@pytest.mark.parametrize('outcome', ['success', 'decline', 'failure'])
+def test_update_menu_launch_instruction_only_after_success(app, config, monkeypatch, tmp_path, capsys, outcome):
+    """Exercise the real local archive/update transaction, never a host command."""
+    release_source = tmp_path / 'release-source'
+    app.copy_package(PACKAGE, release_source)
+    (release_source / 'VERSION').write_text('1.4.3')
+    release = tmp_path / 'release.tar.gz'
+    with tarfile.open(release, 'w:gz') as archive:
+        for path in release_source.rglob('*'):
+            if path.is_file():
+                archive.add(path, arcname=path.relative_to(release_source).as_posix(), recursive=False)
+    app.INSTALL.mkdir()
+    (app.INSTALL / 'VERSION').write_text('1.4.2')
+    (app.INSTALL / 'selfsteal.py').write_text('retained test controller')
+    monkeypatch.setattr(app, 'verified_download', lambda _, __, destination: shutil.copyfile(release, destination))
+    monkeypatch.setattr(app, 'check_install_resources', lambda: None)
+    monkeypatch.setattr(app, 'assert_compose_owned', lambda: None)
+    monkeypatch.setattr(app, 'confirm', lambda _: outcome != 'decline')
+    calls = []
+    def apply(command, **_):
+        calls.append(command)
+        assert command[-1] == '_update-apply', 'Only the offline update application may be requested'
+        if outcome == 'failure':
+            raise app.Failure('Simulated apply failure')
+        return result()
+    monkeypatch.setattr(app, 'run', apply)
+    selected = SimpleNamespace(package_url='https://owner.example/release.tar.gz', sha256='a' * 64, version='1.4.3')
+    if outcome == 'success':
+        app.update(config, selected)
+        assert len(calls) == 1
+    else:
+        with pytest.raises(app.Failure):
+            app.update(config, selected)
+    output = capsys.readouterr().out
+    assert ('Для запуска меню: transitclient' in output) == (outcome == 'success')
+    assert (app.INSTALL / 'VERSION').read_text() == ('1.4.3' if outcome == 'success' else '1.4.2')
+
+
 def test_staging_requires_explicit_trust(app, config):
     config['ca'] = app.STAGING
     with pytest.raises(app.Failure, match='trust bundle'):
@@ -1249,7 +1287,7 @@ def test_setting_confirmation_shows_old_and_new_before_decline(app, config, monk
     monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
     def read(prompt):
         if '[y/N]' in prompt:
-            assert 'HTTP-порт: 8080 → 8091' in capsys.readouterr().out
+            assert 'HTTP-порт для сертификата: 8080 → 8091' in capsys.readouterr().out
         return next(answers)
     monkeypatch.setattr('builtins.input', read)
     with pytest.raises(app.Failure):

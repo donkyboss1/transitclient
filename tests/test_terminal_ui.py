@@ -3,6 +3,7 @@ import argparse
 import importlib.util
 import io
 from pathlib import Path
+import re
 import sys
 
 import pytest
@@ -58,10 +59,15 @@ def test_view_and_back_never_perform(app, ui, monkeypatch, submenu):
     assert ui.run(app, args()) == 0
 
 
-def test_nested_settings_and_cancel_return_one_level(app, ui, monkeypatch, capsys):
-    monkeypatch.setattr(app, 'perform', lambda _: pytest.fail('Browsing cannot perform'))
-    inputs(monkeypatch, ['2', '4', KeyboardInterrupt(), '0', '0'])
+def test_docker_settings_cancel_returns_to_main(app, ui, monkeypatch, capsys):
+    calls = []
+    def cancel(selected):
+        calls.append((selected.command, selected._configure_choice))
+        raise KeyboardInterrupt
+    monkeypatch.setattr(app, 'perform', cancel)
+    inputs(monkeypatch, ['2', '4', '0'])
     assert ui.run(app, args()) == 0
+    assert calls == [('configure', '4')]
     assert 'Действие отменено' in capsys.readouterr().out
 
 
@@ -267,8 +273,9 @@ def test_summary_fragment_styles_keep_values_neutral_and_domain_bold_cyan(app, u
     assert re.search(r'\x1b\[1m\s*10\x1b\[0m\)', text)
 
 
-@pytest.mark.parametrize('value,expected', [('⚙️Настройки', '⚙️  Настройки'), ('🗑️Удаление', '🗑️  Удаление'),
-                                           ('☁️Облако', '☁️  Облако'), ('Текст✅Готово', 'Текст ✅  Готово')])
+@pytest.mark.parametrize('value,expected', [('⚙️Настройки', '⚙️ Настройки'), ('🗑️Удаление', '🗑️ Удаление'),
+                                           ('☁️Облако', '☁️ Облако'), ('Текст✅Готово', 'Текст ✅ Готово'),
+                                           ('⚙️  Настройки', '⚙️ Настройки'), ('☁️   Облако', '☁️ Облако')])
 def test_emoji_always_has_text_separator(ui, value, expected):
     assert ui.clean(value) == expected
     assert ui.clean(ui.clean(value)) == expected
@@ -287,3 +294,124 @@ def test_fragment_clipping_preserves_bold_and_cyan_without_overflow(ui, monkeypa
     assert text.startswith('\x1b[1mДомен:\x1b[0m ')
     assert '\x1b[1;36m' in text and text.endswith('…\x1b[0m')
     assert ui.display_width(re.sub(r'\x1b\[[0-9;]*m', '', text)) == 20
+
+
+SUMMARY_LABELS = ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка')
+
+
+def summary_lines(text):
+    plain = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)
+    return [line for line in plain.splitlines() if any(line.startswith(label + ':') for label in SUMMARY_LABELS)]
+
+
+@pytest.mark.parametrize('size', [(80, 40), (48, 20)])
+def test_same_summary_is_kept_on_every_submenu(app, ui, monkeypatch, size):
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda *_: size)
+    terminal = ui.Terminal(no_color=True)
+    ui.draw(terminal, app, 'main')
+    expected = summary_lines(output.getvalue())
+    assert [line.split(':', 1)[0] for line in expected] == list(SUMMARY_LABELS)
+    for screen in ('settings', 'tests', 'sites'):
+        output.seek(0)
+        output.truncate()
+        ui.draw(terminal, app, screen)
+        assert summary_lines(output.getvalue()) == expected, screen
+
+
+@pytest.mark.parametrize('size', [(80, 40), (48, 20)])
+@pytest.mark.parametrize('path', [('1',), ('3',), ('4',), ('7',), ('8',), ('9',), ('10',),
+                                ('2', '1'), ('2', '4'), ('5', '1'), ('5', '2'), ('5', '3'), ('6', 'i')])
+def test_operation_keeps_shared_header_before_action(app, ui, monkeypatch, size, path):
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda *_: size)
+    seen = []
+    def operation(_):
+        visible = output.getvalue().rsplit('\x1b[2J\x1b[H', 1)[-1]
+        seen.append(visible)
+    monkeypatch.setattr(app, 'perform', operation)
+    # EOF after the action also proves it cannot redraw before acknowledging the result.
+    inputs(monkeypatch, list(path) + [EOFError()])
+    assert ui.run(app, args()) == 0
+    assert len(seen) == 1
+    visible = seen[0]
+    assert 'Transit Client · ' + (app.PACKAGE / 'VERSION').read_text().strip() in visible
+    assert [line.split(':', 1)[0] for line in summary_lines(visible)] == list(SUMMARY_LABELS)
+    assert not re.search(r'\b(?:1|2|3|10)\)', visible), 'Action header must not include the menu list'
+
+
+def test_settings_explains_port_purpose_and_exposes_docker_directly(app, ui, monkeypatch):
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    ui.draw(ui.Terminal(no_color=True), app, 'settings')
+    text = output.getvalue()
+    for number, label in [('1', 'HTTP-порт для сертификата'), ('2', 'Порт для проксирования трафика'),
+                          ('3', 'Локальный HTTPS-порт веб-сервера'), ('4', 'Docker-сеть')]:
+        assert re.search(r'\b' + number + r'\) ' + re.escape(label), text)
+    assert 'Дополнительные настройки' not in text
+
+
+def test_settings_four_performs_configure_without_intermediate_screen(app, ui, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, 'perform', lambda selected: calls.append((selected.command, selected._configure_choice)) or 0)
+    inputs(monkeypatch, ['2', '4', '', '0', '0'])
+    assert ui.run(app, args()) == 0
+    assert calls == [('configure', '4')]
+
+
+def test_operation_stream_uses_one_emoji_space_preserves_lines_ansi_and_payload(app, ui, monkeypatch):
+    output, errors = Output(), Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setattr(sys, 'stderr', errors)
+    def operation(_):
+        print('✅  Готово')
+        sys.stdout.write('☁️')
+        sys.stdout.flush()
+        sys.stdout.write('   Облако\n')
+        print('PATH=/root/a  b/key.pem')
+        print('{"target":"127.0.0.1:9443", "note":"a  b"}')
+        sys.stderr.write('⚠️\x1b[33m  Ошибка\x1b[0m\n')
+        return 1
+    monkeypatch.setattr(app, 'perform', operation)
+    inputs(monkeypatch, ['3', '', '0'])
+    assert ui.run(app, args()) == 0
+    text = output.getvalue()
+    assert '✅ Готово\n☁️ Облако\n' in text
+    assert 'PATH=/root/a  b/key.pem\n' in text
+    assert '{"target":"127.0.0.1:9443", "note":"a  b"}\n' in text
+    assert re.sub(r'\x1b\[[0-9;]*m', '', errors.getvalue()) == '⚠️ Ошибка\n'
+    assert '\x1b[33m' in errors.getvalue() and '\x1b[0m' in errors.getvalue()
+    assert sys.stdout is output and sys.stderr is errors, 'Stream wrappers must be restored on return'
+
+
+@pytest.mark.parametrize('error', [KeyboardInterrupt(), EOFError()])
+def test_operation_stream_is_restored_after_cancel_or_eof(app, ui, monkeypatch, error):
+    output, errors = Output(), Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setattr(sys, 'stderr', errors)
+    def operation(_):
+        sys.stdout.write('☁️')
+        raise error
+    monkeypatch.setattr(app, 'perform', operation)
+    inputs(monkeypatch, ['3', '0'])
+    assert ui.run(app, args()) == 0
+    assert sys.stdout is output and sys.stderr is errors
+    assert '☁️' in output.getvalue(), 'Partial output must not be lost on cancel'
+
+
+@pytest.mark.parametrize('raw,expected', [('🇷🇺  RU', '🇷🇺 RU'), ('👩🏽‍💻  Код', '👩🏽‍💻 Код'),
+                                        ('🛠️Инструменты', '🛠️ Инструменты')])
+def test_operation_stream_preserves_emoji_clusters_across_write_boundaries(app, ui, monkeypatch, raw, expected):
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    def operation(_):
+        for char in raw + '\n':
+            sys.stdout.write(char)
+            sys.stdout.flush()
+    monkeypatch.setattr(app, 'perform', operation)
+    inputs(monkeypatch, ['3', '', '0'])
+    assert ui.run(app, args()) == 0
+    assert expected + '\n' in output.getvalue()

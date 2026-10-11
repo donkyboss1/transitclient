@@ -1,5 +1,8 @@
 """Small Russian terminal UI. Operations stay in the existing controller."""
 import argparse
+import builtins
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import io
 import re
 import os
 import shutil
@@ -27,9 +30,7 @@ def clean(value):
             result += ' '
         result += group
         if emoji and index + 1 < len(groups):
-            # Some SSH fonts draw VS16 emoji wider than the grid cell. Leave a
-            # real two-space gap, independent of ANSI and idempotent on redraw.
-            result += '  '
+            result += ' '
             skip_spaces = True
     return result
 
@@ -127,6 +128,91 @@ class Terminal:
         print(''.join(parts))
 
 
+class EmojiStream:
+    """Normalize human operation output as it arrives, including input prompts."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.after_emoji = False
+        self.separator = False
+        self.previous = ''
+        self.escape = ''
+        self.regional_pending = False
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def write(self, text):
+        output = []
+        for char in text:
+            # Preserve controller ANSI verbatim; it is not printable text.
+            if self.escape or char == '\x1b':
+                output.append(char)
+                self.escape += char
+                if len(self.escape) > 1 and (self.escape[1] != '[' or
+                                             len(self.escape) > 2 and '@' <= char <= '~'):
+                    self.escape = ''
+                continue
+            if char in ('\n', '\r'):
+                output.append(char)
+                self.after_emoji = self.separator = False
+                self.regional_pending = False
+                self.previous = char
+                continue
+            if char in ('\ufe0e', '\ufe0f', '\u200d') or unicodedata.combining(char) or '\U0001f3fb' <= char <= '\U0001f3ff':
+                output.append(char)
+                if char == '\ufe0f':
+                    self.after_emoji, self.separator = True, False
+                self.previous = char
+                continue
+            regional = '\U0001f1e6' <= char <= '\U0001f1ff'
+            joined = self.previous == '\u200d' or regional and self.regional_pending
+            emoji = '\U0001f000' <= char <= '\U0001faff' or '\u2600' <= char <= '\u27bf'
+            if self.after_emoji and not joined:
+                if not self.separator:
+                    output.append(' ')
+                    self.separator = True
+                    self.previous = ' '
+                if char == ' ':
+                    self.regional_pending = False
+                    continue
+                self.after_emoji = self.separator = False
+            if emoji and not joined and self.previous and not self.previous.isspace():
+                if not output or output[-1] != ' ':
+                    output.append(' ')
+            output.append(char)
+            self.previous = char
+            self.regional_pending = regional and not joined
+            if emoji:
+                self.after_emoji, self.separator = True, False
+        self.stream.write(''.join(output))
+        return len(text)
+
+
+@contextmanager
+def operation_output(terminal, header_lines):
+    """Keep the summary above the scrolling operation body in a real terminal."""
+    pinned = terminal.controls and header_lines + 2 < terminal.height
+    if pinned:
+        print(f'\x1b[{header_lines + 1};{terminal.height}r\x1b[{header_lines + 1};1H', end='', flush=True)
+    original_input = builtins.input
+
+    def spaced_input(prompt=''):
+        # CPython's real TTY readline may bypass sys.stdout.write for prompts.
+        buffer = io.StringIO()
+        EmojiStream(buffer).write(prompt)
+        return original_input(buffer.getvalue())
+
+    try:
+        builtins.input = spaced_input
+        with redirect_stdout(EmojiStream(sys.stdout)), redirect_stderr(EmojiStream(sys.stderr)):
+            yield
+    finally:
+        builtins.input = original_input
+        if pinned:
+            print(f'\x1b[r\x1b[{terminal.height};1H', end='', flush=True)
+
+
 GROUPS = [
     ('🔧 Установка и настройки', [('1', '🚀 Установка', 'install'), ('2', '⚙️ Настройки', 'settings')]),
     ('📊 Состояние и проверки', [('3', '📊 Статус', 'status'), ('4', '🔍 Диагностика', 'diagnose'), ('5', '🧪 Самопроверка', 'tests')]),
@@ -135,7 +221,7 @@ GROUPS = [
 MENU = {number: (label, action) for _, options in GROUPS for number, label, action in options}
 OPERATIONS = {number: action for number, (_, action) in MENU.items() if action not in ('settings', 'tests', 'sites')}
 COMPACT_LABELS = {'guide': '📖 Подключение', 'renew': '🔐 Продление'}
-TITLES = {'settings': '⚙️ Настройки', 'advanced': '⚙️ Дополнительные настройки',
+TITLES = {'settings': '⚙️ Настройки',
           'tests': '🧪 Самопроверка', 'sites': '🎨 Сайт-заглушка'}
 
 
@@ -153,7 +239,7 @@ def columns(terminal, options):
         terminal.fragments(left)
 
 
-def draw(terminal, app, screen, notice=''):
+def draw_header(terminal, app):
     terminal.width, terminal.height = shutil.get_terminal_size((80, 40))
     panel = client_panel.snapshot(app)
     compact = terminal.width < 70 or terminal.height < 36
@@ -163,14 +249,18 @@ def draw(terminal, app, screen, notice=''):
     if not compact:
         terminal.line('─' * min(60, terminal.width), 'label')
     rows = panel['rows']
-    if compact and screen == 'sites':
-        rows = [row for row in rows if row[0] != 'Продление']
     if terminal.height < 18:
         rows = [row for row in rows if row[0] in ('Сервер', 'Домен', 'SSL', 'HTTPS')]
     for label, value in rows:
         padding = ' ' if compact else ' ' * max(1, 14 - display_width(label + ':'))
         terminal.fragments([(label + ':', 'bold'), (padding, None), (value, 'domain' if label == 'Домен' else None)])
     terminal.line('─' * min(60, terminal.width), 'label')
+    return panel, 2 + len(rows) + int(not compact)
+
+
+def draw(terminal, app, screen, notice=''):
+    panel, _ = draw_header(terminal, app)
+    compact = terminal.width < 70 or terminal.height < 36
     config = panel.get('config')
     if screen == 'main':
         if compact:
@@ -188,12 +278,11 @@ def draw(terminal, app, screen, notice=''):
     else:
         terminal.line(TITLES[screen], 'bold')
         if screen == 'settings':
-            for number, key, label in [('1', 'challenge_port', 'HTTP-порт'), ('2', 'vpn_port', 'VPN-порт'),
-                                        ('3', 'local_port', 'Локальный HTTPS-порт')]:
+            for number, key, label in [('1', 'challenge_port', 'HTTP-порт для сертификата'),
+                                       ('2', 'vpn_port', 'Порт для проксирования трафика'),
+                                       ('3', 'local_port', 'Локальный HTTPS-порт веб-сервера')]:
                 terminal.fragments(option(number, f"{label}: {(config or {}).get(key) or 'неизвестно'}"))
-            terminal.fragments(option('4', 'Дополнительные настройки'))
-        elif screen == 'advanced':
-            terminal.fragments(option('1', 'Docker-сеть: ' + ((config or {}).get('docker_network') or 'host / loopback')))
+            terminal.fragments(option('4', 'Docker-сеть: ' + ((config or {}).get('docker_network') or 'host / loopback')))
         elif screen == 'tests':
             terminal.fragments(option('1', 'Локальная HTTPS — без изменений'))
             terminal.fragments(option('2', 'HTTP через релей — временный тест'))
@@ -248,8 +337,6 @@ def run(app, args):
                 continue
             action = MENU.get(choice, (None, None))[1] if screen == 'main' else None
             destination = action if action in ('settings', 'tests', 'sites') else None
-            if screen == 'settings' and choice == '4':
-                destination = 'advanced'
             if destination:
                 stack.append(destination)
                 continue
@@ -258,10 +345,8 @@ def run(app, args):
             selected.json, selected.http01, selected.vpn = False, False, False
             if screen == 'main' and choice in OPERATIONS:
                 selected.command = OPERATIONS[choice]
-            elif screen == 'settings' and choice in ('1', '2', '3'):
+            elif screen == 'settings' and choice in ('1', '2', '3', '4'):
                 selected.command, selected._configure_choice = 'configure', choice
-            elif screen == 'advanced' and choice == '1':
-                selected.command, selected._configure_choice = 'configure', '4'
             elif screen == 'tests' and choice in ('1', '2', '3'):
                 selected.command = 'self-test'
                 selected.http01, selected.vpn = choice == '2', choice == '3'
@@ -272,11 +357,12 @@ def run(app, args):
                 notice = 'Неизвестный пункт. Выберите действие из списка.'
                 continue
             try:
-                terminal.clear()
-                draw_title = TITLES.get(screen) or MENU[choice][0]
-                terminal.line('🚀 Transit Client · ' + draw_title, 'heading')
-                app.perform(selected)
-                input('Нажмите Enter для возврата…')
+                _, header_lines = draw_header(terminal, app)
+                with operation_output(terminal, header_lines):
+                    draw_title = TITLES.get(screen) or MENU[choice][0]
+                    terminal.line(draw_title, 'bold')
+                    app.perform(selected)
+                    input('Нажмите Enter для возврата…')
             except KeyboardInterrupt:
                 if len(stack) > 1:
                     stack.pop()

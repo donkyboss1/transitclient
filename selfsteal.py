@@ -127,10 +127,10 @@ def change_template(config, selected=None, *, approved=False):
     print('✅ Сайт: ' + metadata['name'] + '. Сертификат и порты не изменены.')
 
 
-def confirm(prompt, *, english=False):
+def confirm(prompt):
     # Propagate EOF/interrupt through the lifecycle's finally/rollback handlers.
-    answer = input(prompt + (' [y/N]: ' if english else ' [да/нет]: ')).strip().lower()
-    return answer in ('y', 'yes') if english else answer == 'да'
+    answer = input(prompt + ' [y/N]: ').strip().lower()
+    return answer == 'y'
 
 
 def run(args, *, check=True, timeout=60, input=None):
@@ -1213,15 +1213,21 @@ def installation_plan(config):
         print('  Установить пакеты: ' + ', '.join(missing))
     print('  Сертификат: ' + ('тестовый' if config['ca'] == STAGING else "Let's Encrypt") + '; автоматическое продление.')
     print('  Команда управления: transitclient. Нода и существующие сайты сохраняются.')
-    return confirm('Установить?', english=True)
+    return confirm('Установить?')
 
 
 def install(args):
     global PACKAGE
     check_install_resources()
-    if not CONFIG.exists() and INSTALL.exists() and package_owned():
-        PACKAGE = INSTALL
-        print('📦 Сохранён собственный исходный пакет после удаления; используется его закреплённая версия.')
+    if (STATE / 'update-transaction.json').exists():
+        raise Failure('Замена пакета не завершена. Сначала выполните '
+                      'sudo python3 /var/lib/tenant-selfsteal/recover.py _recover.', 'UPDATE_RECOVERY_REQUIRED')
+    retained_package = not CONFIG.exists() and INSTALL.exists() and PACKAGE != INSTALL
+    retained_marker = read_json(INSTALL / '.transitclient-package.json') if retained_package else None
+    if retained_package:
+        print('📦 Сохранён собственный пакет ' + (INSTALL / 'VERSION').read_text().strip()
+              + '. После подтверждения будет установлен входящий пакет '
+              + (PACKAGE / 'VERSION').read_text().strip() + '; прежний пакет сохранится для отката.')
     diagnostics = diagnostic_module()
     initial_report = diagnostics.collect()
     diagnostics.display_compact(initial_report)
@@ -1283,6 +1289,7 @@ def install(args):
     if not installation_plan(config):
         raise Failure('Установка отменена.', 'CANCELLED')
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    STATE.chmod(0o700)
     config.setdefault('install_id', uuid.uuid4().hex)
     if not CONFIG.exists():
         if config['ca'] == STAGING:
@@ -1302,14 +1309,37 @@ def install(args):
                                   for name in ('renew.service', 'renew.timer', 'recover.service')
                                   if (UNITS / ('tenant-selfsteal-' + name)).exists()}})
         atomic_json(CONFIG, config)
+    package_transaction = False
     try:
         dependencies()
         if PACKAGE != INSTALL:
             with tempfile.TemporaryDirectory(dir=INSTALL.parent, prefix='tenant-selfsteal-stage-') as staging:
                 staged = Path(staging) / 'package'
                 copy_package(PACKAGE, staged)
+                if retained_package and not INSTALL.exists():
+                    raise Failure('Сохранённый пакет исчез после диагностики.', 'OWNERSHIP_CONFLICT')
                 if INSTALL.exists():
-                    raise Failure('Путь установки изменился после диагностики.', 'OWNERSHIP_CONFLICT')
+                    if (not retained_package or not package_owned()
+                            or read_json(INSTALL / '.transitclient-package.json') != retained_marker):
+                        raise Failure('Путь установки изменился после диагностики.', 'OWNERSHIP_CONFLICT')
+                    identifier = uuid.uuid4().hex
+                    backup = INSTALL.with_name('tenant-selfsteal.previous-' + identifier)
+                    snapshot = STATE / ('update-backup-' + identifier)
+                    if backup.exists() or snapshot.exists() or (STATE / 'update-transaction.json').exists():
+                        raise Failure('Сохранена прежняя операция замены пакета; выполните '
+                                      'sudo python3 /var/lib/tenant-selfsteal/recover.py _recover.', 'UPDATE_RECOVERY_REQUIRED')
+                    snapshot.mkdir(mode=0o700)
+                    helpers = ('recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py')
+                    for name in ('Caddyfile', 'compose.yaml', 'docker-compose', *helpers):
+                        if (STATE / name).exists():
+                            shutil.copy2(STATE / name, snapshot / name)
+                    # Stable recovery must exist before a possible rename gap.
+                    for name in helpers:
+                        shutil.copyfile(PACKAGE / ('selfsteal.py' if name == 'recover.py' else name), STATE / name)
+                        (STATE / name).chmod(0o600)
+                    atomic_json(STATE / 'update-transaction.json', {'id': identifier})
+                    package_transaction = True
+                    os.replace(INSTALL, backup)
                 os.replace(staged, INSTALL)
             PACKAGE = INSTALL
         (INSTALL / 'selfsteal.sh').chmod(0o700)
@@ -1318,6 +1348,11 @@ def install(args):
         render_caddy(config)
         # Recovery is installed before issuance, not after a successful first run.
         install_units()
+        if package_transaction:
+            # Commit the package before firewall/ACME: later issuance failure
+            # leaves the new partial installation available for normal renew.
+            (STATE / 'update-transaction.json').unlink()
+            package_transaction = False
         try:
             firewall.apply(firewall_plan, config, STATE, run, atomic_json)
         except firewall.FirewallError as exc:
@@ -1333,6 +1368,8 @@ def install(args):
         (STATE / 'configuration-transaction.json').unlink(missing_ok=True)
         renew(config)
     except BaseException:
+        if package_transaction:
+            recover_update()
         recover_configuration()
         raise
 
@@ -1672,7 +1709,7 @@ def uninstall():
     print('Удаление остановит продление и локальный selfsteal. VPN-нода и чужие ресурсы сохраняются.')
     print(f'Ресурсы: {LAUNCHER}, свои tenant-selfsteal units и Compose проект {PROJECT}.')
     print('⚠️ VPN selfsteal target перестанет работать. Данные/сертификаты будут сохранены в backup.')
-    if input('Удалить ресурсы tenant-selfsteal [да/нет]? ').strip().lower() != 'да':
+    if not confirm('Удалить ресурсы tenant-selfsteal?'):
         raise Failure('Удаление отменено.', 'CANCELLED')
     check_install_resources()
     assert_compose_owned()
@@ -1687,6 +1724,7 @@ def uninstall():
     backup = STATE.with_name('tenant-selfsteal-backup-' + time.strftime('%Y%m%d%H%M%S'))
     if backup.exists():
         raise Failure('Имя резервной копии уже занято.', 'BACKUP_CONFLICT')
+    STATE.chmod(0o700)
     shutil.copy2(CONFIG, STATE / 'config-backup.json')
     os.replace(STATE, backup)
     CONFIG.unlink()

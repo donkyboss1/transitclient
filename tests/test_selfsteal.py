@@ -75,7 +75,7 @@ def test_first_setup_only_asks_domain_and_three_ports(app, monkeypatch):
 
 
 @pytest.mark.parametrize('answer,approved', [('', False), ('n', False), ('N', False),
-                                          ('no', False), ('да', False), ('y', True), ('Y', True), ('yes', True)])
+                                          ('no', False), ('да', False), ('y', True), ('Y', True), ('yes', False)])
 def test_install_confirmation_defaults_to_no(app, config, monkeypatch, answer, approved):
     prompts = []
     def reply(prompt):
@@ -330,7 +330,7 @@ def test_configure_then_renew_uses_agreed_port_preserves_account_cert(app, confi
     current.mkdir(parents=True)
     (current / 'fullchain.pem').write_bytes(b'CERT')
     (current / 'key.pem').write_bytes(b'KEY')
-    answers = iter(['1', '8091', 'да'])
+    answers = iter(['1', '8091', 'y'])
     monkeypatch.setattr('builtins.input', lambda *a: next(answers))
     monkeypatch.setattr(app, 'check_challenge_port', lambda c: None)
     monkeypatch.setattr(app, 'check_dns', lambda c: None)
@@ -808,7 +808,7 @@ def test_bridge_alias_collision_blocks_foreign_network_member(app, config, monke
 def test_configure_cancel_preserves_config_and_cert(app, config, monkeypatch):
     app.atomic_json(app.CONFIG, config)
     before = app.CONFIG.read_bytes()
-    answers = iter(['1', '8091', 'нет'])
+    answers = iter(['1', '8091', 'no'])
     monkeypatch.setattr('builtins.input', lambda *_: next(answers))
     monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
     with pytest.raises(app.Failure, match='не изменены'):
@@ -840,7 +840,7 @@ def test_reconfigure_failure_restores_previous_runtime_and_config(app, config, m
     current.mkdir(parents=True)
     (current / 'fullchain.pem').write_bytes(b'CERT')
     (current / 'key.pem').write_bytes(b'KEY')
-    answers = iter(['3', '9543', 'да'])
+    answers = iter(['3', '9543', 'y'])
     monkeypatch.setattr('builtins.input', lambda *_: next(answers))
     monkeypatch.setattr(app, 'free_port', lambda *_: True)
     calls = []
@@ -941,6 +941,182 @@ def test_saved_own_package_is_reusable_but_changed_controller_is_not(app, config
         app.check_install_resources()
 
 
+@pytest.fixture
+def retained_install(app, config, monkeypatch, tmp_path):
+    monkeypatch.setattr(app, '_test_original_install_launcher', app.install_launcher, raising=False)
+    source = tmp_path / 'incoming'
+    source.mkdir()
+    for name in ('selfsteal.sh', 'selfsteal.py', 'VERSION', 'dependencies.json', 'templates.json', 'README.md', 'LICENSE', 'NOTICE.md',
+                 'diagnostics.py', 'site_templates.py', 'firewall_setup.py'):
+        (source / name).write_text('1.4.1' if name == 'VERSION' else 'incoming ' + name)
+    app.INSTALL.mkdir()
+    (app.INSTALL / 'selfsteal.py').write_text('retained controller')
+    (app.INSTALL / 'selfsteal.sh').write_text('retained shell')
+    (app.INSTALL / 'VERSION').write_text('1.3.3')
+    app.mark_package(config)
+    monkeypatch.setattr(app, 'PACKAGE', source)
+    config.update(install_id='a' * 32)
+    report = SimpleNamespace(collect=lambda *_: {'checks': []}, display_compact=lambda *_, **__: None)
+    firewall = SimpleNamespace(plan=lambda *_: {'changes': []}, apply=lambda *_: None, FirewallError=RuntimeError)
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: report)
+    monkeypatch.setattr(app, 'firewall_module', lambda: firewall)
+    monkeypatch.setattr(app, 'check_launcher', lambda: None)
+    monkeypatch.setattr(app, 'ask', lambda *_: '1')
+    monkeypatch.setattr(app, 'interactive_config', lambda _: config.copy())
+    for name in ('detect_vpn_network', 'check_dns', 'check_challenge_port', 'assert_local_docker', 'assert_compose_owned',
+                 'validate_network', 'dependencies', 'install_launcher', 'render_caddy', 'install_units', 'change_template', 'renew'):
+        monkeypatch.setattr(app, name, lambda *_, **__: None)
+    monkeypatch.setattr(app, 'free_port', lambda *_: True)
+    monkeypatch.setattr(app, 'select_template', lambda *_: 'builtin')
+    monkeypatch.setattr(app.shutil, 'which', lambda _: '/bin/docker')
+    monkeypatch.setattr(app, 'run', lambda *_, **__: result())
+    monkeypatch.setattr(app, 'installation_plan', lambda _: True)
+    return source
+
+
+def test_reinstall_cancel_preserves_incoming_package_selection_and_retained_files(app, retained_install, monkeypatch):
+    monkeypatch.setattr(app, 'installation_plan', lambda _: False)
+    with pytest.raises(app.Failure) as error:
+        app.install(SimpleNamespace(template=None))
+    assert error.value.code == 'CANCELLED'
+    assert app.PACKAGE == retained_install
+    assert (app.INSTALL / 'VERSION').read_text() == '1.3.3'
+    assert not app.CONFIG.exists() and list(app.STATE.iterdir()) == []
+
+
+def test_reinstall_uses_incoming_version_and_preserves_previous_package(app, retained_install):
+    app.install(SimpleNamespace(template=None))
+    assert app.PACKAGE == app.INSTALL
+    assert (app.INSTALL / 'VERSION').read_text() == '1.4.1'
+    assert (app.INSTALL / 'selfsteal.py').read_text() == 'incoming selfsteal.py'
+    assert app.package_owned()
+    previous = list(app.INSTALL.parent.glob('tenant-selfsteal.previous-*'))
+    assert len(previous) == 1 and (previous[0] / 'VERSION').read_text() == '1.3.3'
+    assert not (app.STATE / 'update-transaction.json').exists()
+
+
+def test_reinstall_initialization_failure_restores_retained_package(app, retained_install, monkeypatch):
+    def fail():
+        raise KeyboardInterrupt
+    monkeypatch.setattr(app, 'install_launcher', fail)
+    with pytest.raises(KeyboardInterrupt):
+        app.install(SimpleNamespace(template=None))
+    assert app.PACKAGE == app.INSTALL
+    assert (app.INSTALL / 'VERSION').read_text() == '1.3.3'
+    assert list(app.INSTALL.parent.glob('tenant-selfsteal.failed-*'))
+    assert not (app.STATE / 'update-transaction.json').exists()
+
+
+def test_reinstall_rename_gap_keeps_stable_helper_and_journal_for_recovery(app, retained_install, monkeypatch):
+    replace = app.os.replace
+    def interrupted(source, target):
+        if Path(target) == app.INSTALL and Path(source).name == 'package':
+            raise SystemExit('simulated SIGKILL')
+        return replace(source, target)
+    monkeypatch.setattr(app.os, 'replace', interrupted)
+    # Prevent the in-process exception handler to model a hard process exit.
+    monkeypatch.setattr(app, 'recover_update', lambda: None)
+    with pytest.raises(SystemExit):
+        app.install(SimpleNamespace(template=None))
+    assert not app.INSTALL.exists()
+    assert (app.STATE / 'recover.py').read_text() == 'incoming selfsteal.py'
+    assert (app.STATE / 'update-transaction.json').exists()
+
+
+def test_install_with_config_cannot_replace_different_version(app, retained_install, config):
+    app.atomic_json(app.CONFIG, config)
+    with pytest.raises(app.Failure) as error:
+        app.install(SimpleNamespace(template=None))
+    assert error.value.code == 'UPDATE_REQUIRED'
+    assert (app.INSTALL / 'VERSION').read_text() == '1.3.3'
+
+
+def test_reinstall_foreign_package_never_replaced(app, retained_install):
+    (app.INSTALL / 'selfsteal.py').write_text('foreign replacement')
+    with pytest.raises(app.Failure) as error:
+        app.install(SimpleNamespace(template=None))
+    assert error.value.code == 'OWNERSHIP_UNKNOWN'
+    assert (app.INSTALL / 'selfsteal.py').read_text() == 'foreign replacement'
+
+
+@pytest.mark.parametrize('mode', ['0', '2'])
+def test_reinstall_exit_or_guide_does_not_override_incoming_package(app, retained_install, monkeypatch, mode):
+    monkeypatch.setattr(app, 'ask', lambda *_: mode)
+    monkeypatch.setattr(app, 'guide', lambda *_: None)
+    if mode == '0':
+        with pytest.raises(app.Failure) as error:
+            app.install(SimpleNamespace())
+        assert error.value.code == 'CANCELLED'
+    else:
+        app.install(SimpleNamespace())
+    assert app.PACKAGE == retained_install and (app.INSTALL / 'VERSION').read_text() == '1.3.3'
+    assert not app.CONFIG.exists()
+
+
+def test_reinstall_actual_launcher_and_controller_report_incoming_version(app, retained_install, monkeypatch, tmp_path):
+    import sys
+    (retained_install / 'selfsteal.py').write_bytes((PACKAGE / 'selfsteal.py').read_bytes())
+    launcher = tmp_path / 'transitclient'
+    monkeypatch.setattr(app, 'LAUNCHER', launcher)
+    # Exercise real atomic launcher creation, bypassing only the host's PATH.
+    monkeypatch.setattr(app, 'install_launcher', app._test_original_install_launcher)
+    app.install(SimpleNamespace(template=None))
+    assert str(app.INSTALL / 'selfsteal.py') in launcher.read_text()
+    result = subprocess.run([sys.executable, str(app.INSTALL / 'selfsteal.py'), 'version'], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == 'transitclient 1.4.1'
+
+
+def test_reinstall_pending_package_replacement_blocks_without_prompt(app, retained_install, monkeypatch):
+    app.atomic_json(app.STATE / 'update-transaction.json', {'id': 'b' * 32})
+    # CONFIG would already exist when the replacement's journal is persisted.
+    app.atomic_json(app.CONFIG, {'domain': 'bob.example.com'})
+    monkeypatch.setattr(app, 'ask', lambda *_: pytest.fail('Recovery required before prompting'))
+    with pytest.raises(app.Failure) as error:
+        app.install(SimpleNamespace())
+    assert error.value.code == 'UPDATE_RECOVERY_REQUIRED'
+    assert (app.INSTALL / 'VERSION').read_text() == '1.3.3'
+
+
+def test_reinstall_issuance_failure_keeps_committed_new_package(app, retained_install, monkeypatch):
+    def fail(_):
+        raise app.Failure('ACME unsuccessful')
+    monkeypatch.setattr(app, 'renew', fail)
+    with pytest.raises(app.Failure, match='ACME'):
+        app.install(SimpleNamespace(template=None))
+    assert (app.INSTALL / 'VERSION').read_text() == '1.4.1' and app.PACKAGE == app.INSTALL
+    assert not (app.STATE / 'update-transaction.json').exists()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX directory permissions')
+def test_install_secures_existing_state_directory(app, retained_install):
+    app.STATE.chmod(0o755)
+    app.install(SimpleNamespace(template=None))
+    assert app.STATE.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX directory permissions')
+def test_uninstall_backup_is_root_only_and_retains_account_certificate_and_config(app, config, monkeypatch, tmp_path):
+    app.STATE.chmod(0o755)
+    app.atomic_json(app.CONFIG, config)
+    (app.STATE / 'acme').mkdir()
+    (app.STATE / 'acme/account.key').write_bytes(b'PRIVATE account')
+    (app.STATE / 'certs').mkdir()
+    (app.STATE / 'certs/key.pem').write_bytes(b'PRIVATE certificate')
+    monkeypatch.setattr(app, 'LAUNCHER', tmp_path / 'transitclient')
+    for name in ('check_install_resources', 'assert_compose_owned', 'cleanup_firewall'):
+        monkeypatch.setattr(app, name, lambda: None)
+    monkeypatch.setattr(app, 'run', lambda *_, **__: result())
+    monkeypatch.setattr(app, 'compose', lambda *_, **__: None)
+    monkeypatch.setattr(app, 'confirm', lambda _: True)
+    app.uninstall()
+    backups = list(app.STATE.parent.glob('tenant-selfsteal-backup-*'))
+    assert len(backups) == 1 and backups[0].stat().st_mode & 0o777 == 0o700
+    assert (backups[0] / 'acme/account.key').read_bytes() == b'PRIVATE account'
+    assert (backups[0] / 'certs/key.pem').read_bytes() == b'PRIVATE certificate'
+    assert app.read_json(backups[0] / 'config-backup.json')['domain'] == config['domain']
+    assert not app.CONFIG.exists()
+
+
 def test_ctrl_c_during_reconfiguration_rolls_back_before_propagating(app, config, monkeypatch):
     config.update(vpn_port=443)
     app.render_caddy(config)
@@ -950,7 +1126,7 @@ def test_ctrl_c_during_reconfiguration_rolls_back_before_propagating(app, config
     current.mkdir(parents=True)
     (current / 'fullchain.pem').write_bytes(b'CERT')
     (current / 'key.pem').write_bytes(b'KEY')
-    answers = iter(['9543', 'да'])
+    answers = iter(['9543', 'y'])
     monkeypatch.setattr('builtins.input', lambda *_: next(answers))
     monkeypatch.setattr(app, 'free_port', lambda *_: True)
     interrupted = [False]
@@ -1069,10 +1245,10 @@ def test_declining_uninstall_is_a_cancellation_before_mutations(app, monkeypatch
 def test_setting_confirmation_shows_old_and_new_before_decline(app, config, monkeypatch, capsys):
     app.atomic_json(app.CONFIG, config)
     before = app.CONFIG.read_bytes()
-    answers = iter(['8091', 'нет'])
+    answers = iter(['8091', 'no'])
     monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
     def read(prompt):
-        if '[да/нет]' in prompt:
+        if '[y/N]' in prompt:
             assert 'HTTP-порт: 8080 → 8091' in capsys.readouterr().out
         return next(answers)
     monkeypatch.setattr('builtins.input', read)

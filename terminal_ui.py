@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import unicodedata
+from types import SimpleNamespace
 
 import client_panel
 
@@ -101,6 +102,87 @@ def fit_fragments(fragments, width):
     return result
 
 
+class CellStream:
+    """Place the gap after a two-cell emoji even when the terminal advances one."""
+    positioned = True
+
+    def __init__(self, stream, width, cursor=None):
+        self.stream, self.width = stream, width
+        self.cursor = cursor or SimpleNamespace(column=1, group='', pending=False)
+        self.escape = ''
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def reset(self):
+        self.cursor.column, self.cursor.group, self.cursor.pending = 1, '', False
+
+    def write(self, text):
+        output = []
+        state = self.cursor
+        for char in text:
+            if self.escape or char == '\x1b':
+                output.append(char)
+                self.escape += char
+                if len(self.escape) > 2 and self.escape[1] == '[' and '@' <= char <= '~':
+                    match = re.fullmatch(r'\x1b\[([0-9;]*)([GCHfD])', self.escape)
+                    if match:
+                        values = [int(value or '1') for value in match[1].split(';')]
+                        command = match[2]
+                        if command == 'G':
+                            state.column = max(1, min(self.width, values[0]))
+                        elif command in ('H', 'f'):
+                            state.column = max(1, min(self.width, values[1] if len(values) > 1 else 1))
+                        else:
+                            state.column = max(1, min(self.width, state.column + values[0] * (1 if command == 'C' else -1)))
+                        state.group, state.pending = '', False
+                    self.escape = ''
+                elif len(self.escape) == 2 and self.escape[1] != '[':
+                    self.escape = ''
+                continue
+            if char in ('\r', '\n'):
+                output.append(char)
+                self.reset()
+                continue
+            if char == '\b':
+                output.append(char)
+                state.column = max(1, state.column - 1)
+                state.group, state.pending = '', False
+                continue
+            regional_pair = (len(state.group) == 1 and '\U0001f1e6' <= state.group <= '\U0001f1ff'
+                             and '\U0001f1e6' <= char <= '\U0001f1ff')
+            extension = (unicodedata.combining(char) or char in ('\ufe0e', '\ufe0f', '\u200d')
+                         or state.group.endswith('\u200d') or '\U0001f3fb' <= char <= '\U0001f3ff' or regional_pair)
+            if extension and state.group:
+                before = cluster_width(state.group)
+                state.group += char
+                state.column += cluster_width(state.group) - before
+            else:
+                size = 8 - (state.column - 1) % 8 if char == '\t' else cluster_width(char)
+                # VS16 may arrive in the next write. Keep a possible emoji base
+                # off the final cell before its presentation selector arrives.
+                possible_emoji = ('\u2190' <= char <= '\u27bf'
+                                  or '\u2b00' <= char <= '\u2bff'
+                                  or '\U0001f000' <= char <= '\U0001faff')
+                reserve = max(size, 2) if possible_emoji else size
+                if state.column + reserve - 1 > self.width:
+                    output.append('\r\n')
+                    self.reset()
+                    size = 8 if char == '\t' else size
+                if state.pending:
+                    output.append(f'\x1b[{state.column}G')
+                state.group = char
+                state.column += size
+            state.pending = ('\ufe0f' in state.group or any('\U0001f000' <= item <= '\U0001faff'
+                             or '\u2600' <= item <= '\u27bf' for item in state.group))
+            output.append(char)
+        self.stream.write(''.join(output))
+        # Both TTY streams share the cursor. Emit each positioned write before
+        # the other stream can write, including stdout without a newline.
+        self.stream.flush()
+        return len(text)
+
+
 class Terminal:
     palette = {'heading': '1;36', 'bold': '1', 'domain': '1;36', 'label': None,
                'value': None, 'success': '32', 'warning': '33', 'error': '31'}
@@ -125,66 +207,73 @@ class Terminal:
             code = self.palette.get(role)
             parts.append('\x1b[' + code + 'm' + value + '\x1b[0m'
                          if self.colors and code and value else value)
-        print(''.join(parts))
+        value = ''.join(parts) + '\n'
+        if self.controls and not getattr(sys.stdout, 'positioned', False):
+            CellStream(sys.stdout, self.width).write(value)
+        else:
+            sys.stdout.write(value)
 
 
 class EmojiStream:
     """Normalize human operation output as it arrives, including input prompts."""
 
-    def __init__(self, stream):
+    def __init__(self, stream, state=None):
         self.stream = stream
-        self.after_emoji = False
-        self.separator = False
-        self.previous = ''
-        self.escape = ''
-        self.regional_pending = False
+        self.state = state or SimpleNamespace(after_emoji=False, separator=False,
+                                              previous='', escape='', regional_pending=False)
+
+    def reset(self):
+        self.state.after_emoji = self.state.separator = False
+        self.state.previous = self.state.escape = ''
+        self.state.regional_pending = False
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
 
     def write(self, text):
         output = []
+        state = self.state
         for char in text:
             # Preserve controller ANSI verbatim; it is not printable text.
-            if self.escape or char == '\x1b':
+            if state.escape or char == '\x1b':
                 output.append(char)
-                self.escape += char
-                if len(self.escape) > 1 and (self.escape[1] != '[' or
-                                             len(self.escape) > 2 and '@' <= char <= '~'):
-                    self.escape = ''
+                state.escape += char
+                if len(state.escape) > 1 and (state.escape[1] != '[' or
+                                             len(state.escape) > 2 and '@' <= char <= '~'):
+                    state.escape = ''
                 continue
             if char in ('\n', '\r'):
                 output.append(char)
-                self.after_emoji = self.separator = False
-                self.regional_pending = False
-                self.previous = char
+                state.after_emoji = state.separator = False
+                state.regional_pending = False
+                state.previous = char
                 continue
             if char in ('\ufe0e', '\ufe0f', '\u200d') or unicodedata.combining(char) or '\U0001f3fb' <= char <= '\U0001f3ff':
                 output.append(char)
                 if char == '\ufe0f':
-                    self.after_emoji, self.separator = True, False
-                self.previous = char
+                    state.after_emoji, state.separator = True, False
+                state.previous = char
                 continue
             regional = '\U0001f1e6' <= char <= '\U0001f1ff'
-            joined = self.previous == '\u200d' or regional and self.regional_pending
+            joined = state.previous == '\u200d' or regional and state.regional_pending
             emoji = '\U0001f000' <= char <= '\U0001faff' or '\u2600' <= char <= '\u27bf'
-            if self.after_emoji and not joined:
-                if not self.separator:
+            if state.after_emoji and not joined:
+                if not state.separator:
                     output.append(' ')
-                    self.separator = True
-                    self.previous = ' '
+                    state.separator = True
+                    state.previous = ' '
                 if char == ' ':
-                    self.regional_pending = False
+                    state.regional_pending = False
                     continue
-                self.after_emoji = self.separator = False
-            if emoji and not joined and self.previous and not self.previous.isspace():
+                state.after_emoji = state.separator = False
+            if emoji and not joined and state.previous and not state.previous.isspace():
                 if not output or output[-1] != ' ':
                     output.append(' ')
             output.append(char)
-            self.previous = char
-            self.regional_pending = regional and not joined
+            state.previous = char
+            state.regional_pending = regional and not joined
             if emoji:
-                self.after_emoji, self.separator = True, False
+                state.after_emoji, state.separator = True, False
         self.stream.write(''.join(output))
         return len(text)
 
@@ -196,16 +285,31 @@ def operation_output(terminal, header_lines):
     if pinned:
         print(f'\x1b[{header_lines + 1};{terminal.height}r\x1b[{header_lines + 1};1H', end='', flush=True)
     original_input = builtins.input
+    cursor = SimpleNamespace(column=1, group='', pending=False)
+    stdout = CellStream(sys.stdout, terminal.width, cursor) if terminal.controls else sys.stdout
+    stderr = CellStream(sys.stderr, terminal.width, cursor) if terminal.controls else sys.stderr
+    output = EmojiStream(stdout)
+    errors = EmojiStream(stderr, output.state)
 
     def spaced_input(prompt=''):
         # CPython's real TTY readline may bypass sys.stdout.write for prompts.
         buffer = io.StringIO()
-        EmojiStream(buffer).write(prompt)
-        return original_input(buffer.getvalue())
+        EmojiStream(buffer, output.state).write(prompt)
+        value = buffer.getvalue()
+        if terminal.controls:
+            buffer = io.StringIO()
+            CellStream(buffer, terminal.width, cursor).write(value)
+            value = buffer.getvalue()
+        try:
+            return original_input(value)
+        finally:
+            # Readline echoes the entered text and newline outside our stream.
+            cursor.column, cursor.group, cursor.pending = 1, '', False
+            output.reset()
 
     try:
         builtins.input = spaced_input
-        with redirect_stdout(EmojiStream(sys.stdout)), redirect_stderr(EmojiStream(sys.stderr)):
+        with redirect_stdout(output), redirect_stderr(errors):
             yield
     finally:
         builtins.input = original_input

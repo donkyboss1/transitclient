@@ -1238,9 +1238,14 @@ def install(args):
               + '. После подтверждения будет установлен входящий пакет '
               + (PACKAGE / 'VERSION').read_text().strip() + '; прежний пакет сохранится для отката.')
     diagnostics = diagnostic_module()
-    initial_report = diagnostics.collect()
+    initial_config = validate_config(read_json(CONFIG)) if CONFIG.exists() else None
+    initial_report = diagnostics.collect(initial_config)
     diagnostics.display_compact(initial_report)
-    print('1 🚀 Установить Caddy · 2 📖 Свой веб-сервер · 0 Выход')
+    import terminal_ui
+    terminal = terminal_ui.Terminal(no_color=getattr(args, 'no_color', False))
+    terminal.line('Режим установки', 'bold')
+    for number, label in [('1', '🚀 Установить Caddy'), ('2', '📖 Свой веб-сервер'), ('0', '⬅️ Выход')]:
+        terminal.fragments(terminal_ui.option(number, label))
     mode = ask('Режим', '1')
     if mode == '2':
         guide(None)

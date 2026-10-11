@@ -1069,6 +1069,89 @@ def test_install_with_config_cannot_replace_different_version(app, retained_inst
     assert (app.INSTALL / 'VERSION').read_text() == '1.3.3'
 
 
+def _repeat_install_diagnostics(app, config, monkeypatch, published_port, identifier):
+    """Use real ownership/port diagnostics against an entirely fake local CLI."""
+    spec = importlib.util.spec_from_file_location('repeat_install_diagnostics', PACKAGE / 'diagnostics.py')
+    diagnostics = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(diagnostics)
+    monkeypatch.delenv('DOCKER_HOST', raising=False)
+    monkeypatch.delenv('DOCKER_CONTEXT', raising=False)
+    import json
+    container_id = 'b' * 12
+    inspect = '|'.join(json.dumps(value) for value in (
+        {'9443/tcp': [{'HostIp': '127.0.0.1', 'HostPort': str(published_port)}]},
+        'bridge', '/tenant-selfsteal-caddy', 'caddy:2', True, 'true', identifier))
+
+    def cli(command):
+        if command[:3] == ['docker', 'context', 'show']:
+            return 'default'
+        if command[:3] == ['docker', 'context', 'inspect']:
+            return json.dumps('unix:///var/run/docker.sock')
+        if command[:2] == ['docker', 'info']:
+            return '29.8.2'
+        if command[:3] == ['docker', 'compose', 'version']:
+            return '5.0.0'
+        if command[:2] == ['docker', 'ps']:
+            return container_id
+        if command[:2] == ['docker', 'inspect']:
+            return inspect
+        if command[0] == 'ss':
+            return 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*'
+        if command[:2] == ['ufw', 'status']:
+            return 'Status: inactive'
+        return None
+
+    monkeypatch.setattr(diagnostics, '_run', cli)
+    monkeypatch.setattr(diagnostics, '_resolve_dns', lambda _: ['8.8.8.8'])
+    monkeypatch.setattr(diagnostics, '_attribute_processes', lambda _: None)
+    monkeypatch.setattr(diagnostics, '_web_inventory', lambda _: None)
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: diagnostics)
+    app.atomic_json(app.CONFIG, config)
+    monkeypatch.setattr(app, 'PACKAGE', app.INSTALL)
+    return diagnostics
+
+
+@pytest.mark.parametrize('local_port,challenge_port', [(9443, 8080), (9543, 8180)])
+def test_repeat_install_initial_inventory_uses_saved_ownership_and_ports(
+        app, retained_install, config, monkeypatch, capsys, local_port, challenge_port):
+    config.update(local_port=local_port, challenge_port=challenge_port, vpn_port=443)
+    diagnostics = _repeat_install_diagnostics(app, config, monkeypatch, local_port, config['install_id'])
+    collect = diagnostics.collect
+    reports = []
+
+    def record(candidate=None):
+        report = collect(candidate)
+        reports.append(report)
+        return report
+
+    monkeypatch.setattr(diagnostics, 'collect', record)
+    monkeypatch.setattr(app, 'installation_plan', lambda _: False)
+    monkeypatch.setattr(app, 'dependencies', lambda: pytest.fail('Cancellation precedes mutations'))
+    monkeypatch.setattr(app, 'free_port', lambda *_: pytest.fail('Own installed listener must not be bound again'))
+    before = app.CONFIG.read_bytes()
+    with pytest.raises(app.Failure) as error:
+        app.install(SimpleNamespace(template=None))
+    assert error.value.code == 'CANCELLED'
+    assert reports[0]['docker']['containers'][0]['owned'] is True
+    assert reports[0]['selected_ports']['local']['port'] == local_port
+    assert reports[0]['selected_ports']['challenge']['port'] == challenge_port
+    assert '[HTTPS_PORT_BUSY]' not in capsys.readouterr().out
+    assert app.CONFIG.read_bytes() == before and list(app.STATE.iterdir()) == []
+
+
+def test_repeat_install_foreign_listener_still_blocks_final_guard_without_mutations(
+        app, retained_install, config, monkeypatch):
+    config.update(vpn_port=443)
+    _repeat_install_diagnostics(app, config, monkeypatch, config['local_port'], 'c' * 32)
+    monkeypatch.setattr(app, 'installation_plan', lambda _: pytest.fail('Foreign listener blocks before confirmation'))
+    monkeypatch.setattr(app, 'dependencies', lambda: pytest.fail('Foreign listener blocks before mutations'))
+    before = app.CONFIG.read_bytes()
+    with pytest.raises(app.Failure) as error:
+        app.install(SimpleNamespace(template=None))
+    assert error.value.code == 'HTTPS_PORT_BUSY'
+    assert app.CONFIG.read_bytes() == before and list(app.STATE.iterdir()) == []
+
+
 def test_reinstall_foreign_package_never_replaced(app, retained_install):
     (app.INSTALL / 'selfsteal.py').write_text('foreign replacement')
     with pytest.raises(app.Failure) as error:

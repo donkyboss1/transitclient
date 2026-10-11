@@ -32,6 +32,122 @@ SGR = re.compile(r'\x1b\[[0-9;]*m')
 CSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
 
 
+class NarrowEmojiTerminal:
+    """Independent VT replay: SSH draws these VS16 glyphs in two cells,
+    with either one- or two-cell native cursor advance. This models terminal behavior,
+    rather than calling the renderer's width or placement implementation.
+    """
+
+    narrow_bases = {'⚙', '☁', '🗑', '⬅'}
+
+    def __init__(self, columns=80, lines=40, native_emoji_advance=1):
+        self.columns, self.lines = columns, lines
+        self.native_emoji_advance = native_emoji_advance
+        self.row = self.column = 0
+        self.top, self.bottom = 0, lines - 1
+        self.saved = (0, 0)
+        self.draws = []
+
+    def feed(self, data):
+        index = 0
+        while index < len(data):
+            if data[index] == '\x1b':
+                command = re.match(r'\x1b\[([0-9;?]*)([A-Za-z])', data[index:])
+                assert command, 'Unsupported VT sequence in acceptance oracle: ' + repr(data[index:index + 20])
+                parameters, final = command.groups()
+                numbers = [int(number or '0') for number in parameters.lstrip('?').split(';')]
+                amount = numbers[0] or 1
+                if final in ('H', 'f'):
+                    self.row = amount - 1
+                    self.column = (numbers[1] or 1) - 1 if len(numbers) > 1 else 0
+                elif final in ('G',):
+                    self.column = amount - 1
+                elif final in ('C', 'a'):
+                    self.column += amount
+                elif final == 'D':
+                    self.column = max(0, self.column - amount)
+                elif final in ('A', 'B'):
+                    self.row += amount * (1 if final == 'B' else -1)
+                elif final in ('E', 'F'):
+                    self.row += amount * (1 if final == 'E' else -1)
+                    self.column = 0
+                elif final == 'd':
+                    self.row = amount - 1
+                elif final == 's':
+                    self.saved = self.row, self.column
+                elif final == 'u':
+                    self.row, self.column = self.saved
+                elif final == 'r':
+                    self.top = amount - 1
+                    self.bottom = (numbers[1] or self.lines) - 1 if len(numbers) > 1 else self.lines - 1
+                    self.row = self.column = 0
+                elif final == 'J' and numbers[0] == 2:
+                    self.draws.clear()
+                else:
+                    assert final in ('m', 'J', 'K', 'h', 'l'), 'Unknown VT command: ' + command.group(0)
+                index += len(command.group(0))
+                continue
+            char = data[index]
+            index += 1
+            if char == '\r':
+                self.column = 0
+                continue
+            if char == '\n':
+                # Default SSH PTY OPOST/ONLCR resets the column on a newline.
+                self.column = 0
+                if self.row == self.bottom:
+                    self.draws = [dict(item, row=item['row'] - 1) if self.top < item['row'] <= self.bottom else item
+                                  for item in self.draws if item['row'] != self.top]
+                else:
+                    self.row += 1
+                continue
+            if char in ('\ufe0e', '\ufe0f') or unicodedata.combining(char):
+                if self.draws:
+                    self.draws[-1]['glyph'] += char
+                    if char == '\ufe0f':
+                        if self.draws[-1]['glyph'][0] in self.narrow_bases:
+                            self.column += self.native_emoji_advance - 1
+                        self.draws[-1]['width'] = 2
+                continue
+            if char == '\b':
+                self.column = max(0, self.column - 1)
+                continue
+            if char == '\t':
+                self.column = (self.column // 8 + 1) * 8
+                continue
+            if ord(char) < 32:
+                continue
+            native = 1 if char in self.narrow_bases else 2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+            if self.column >= self.columns:
+                self.column = 0
+                self.row += 1
+            self.draws.append(dict(glyph=char, row=self.row, column=self.column, width=native))
+            self.column += native
+        return self
+
+    def assert_gap(self, glyph):
+        occurrences = 0
+        for index, icon in enumerate(self.draws):
+            if icon['glyph'] != glyph:
+                continue
+            following = next((item for item in self.draws[index + 1:]
+                              if item['row'] == icon['row'] and not item['glyph'].isspace()), None)
+            if following is None:
+                continue
+            occurrences += 1
+            assert icon['column'] + icon['width'] <= self.columns, ('Glyph extends beyond terminal', icon)
+            gap = following['column'] - icon['column'] - icon['width']
+            assert gap == 1, (glyph, 'effective blank cells', gap, 'icon', icon, 'next text', following)
+        assert occurrences, 'No visible ' + repr(glyph) + ' followed by text'
+
+
+def assert_vs16_geometry(raw, glyph, columns=80, lines=40, native_emoji_advance=None):
+    for advance in (1, 2) if native_emoji_advance is None else (native_emoji_advance,):
+        NarrowEmojiTerminal(columns, lines, advance).feed(raw).assert_gap(glyph)
+    plain = CSI.sub('', raw)
+    assert glyph + ' ' in plain and glyph + '  ' not in plain, 'Exactly one literal ASCII separator required'
+
+
 def line_width(text):
     """Independent width estimate for menu emoji, Cyrillic and variation selectors."""
     widths = []
@@ -59,6 +175,7 @@ def child(scenario, no_color):
     sys.path.insert(0, str(ROOT))
     import selfsteal as app
     import client_panel
+    real_install = app.install
 
     def forbidden(*args, **kwargs):
         raise AssertionError('FORBIDDEN_REAL_OPERATION')
@@ -94,9 +211,31 @@ def child(scenario, no_color):
                 ('Продление', 'Включено · следующий запуск завтра'), ('Заглушка', '☁️Тестовый сайт')]
         client_panel.snapshot = lambda *a, **k: dict(rows=rows, hint='HTTPS не подтверждён → Самопроверка',
                                                     config=dict(config), installation=state)
+        if scenario == 'install-mode':
+            app.check_install_resources = lambda: None
+            app.diagnostic_module = lambda: SimpleNamespace(collect=lambda *_: {'checks': []},
+                                                            display_compact=lambda *_, **__: None)
+            app.guide = lambda *_: print('MODE_GUIDE', flush=True)
 
         def fake_perform(args):
             command = args.command
+            if scenario in ('vs16-output', 'vs16-buffered'):
+                for chunk in ('☁', '\ufe0f'):
+                    sys.stdout.write(chunk)
+                    if scenario == 'vs16-output':
+                        sys.stdout.flush()
+                sys.stderr.write(' ')
+                sys.stderr.flush()
+                sys.stdout.write('Облако\n')
+                sys.stdout.flush()
+                print('🗑️ Удаление', file=sys.stderr, flush=True)
+                input('⚙️ Введите значение: ')
+            if scenario == 'vs16-edge':
+                columns = os.get_terminal_size().columns
+                for glyph in ('⚙️', '☁️', '🗑️', '⬅️'):
+                    for chunk in ('x' * (columns - 2) + ' ', glyph[0], glyph[1], ' A\n'):
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
             if scenario == 'stream-output':
                 print('✅  Готово', flush=True)
                 sys.stdout.write('☁️')
@@ -110,6 +249,13 @@ def child(scenario, no_color):
                 for index in range(75):
                     print('REPORT_LINE=' + str(index), flush=True)
             if command == 'install':
+                if scenario == 'install-mode':
+                    try:
+                        real_install(args)
+                    except app.Failure as exc:
+                        assert exc.code == 'CANCELLED', exc.code
+                        print('MODE_CANCELLED', flush=True)
+                    return 0
                 approved = app.installation_plan(config)
                 print('INSTALL_APPROVED' if approved else 'INSTALL_CANCELLED', flush=True)
                 if approved:
@@ -152,6 +298,8 @@ class Session:
         pid, fd = pty.fork()
         if pid == 0:
             variables = dict(os.environ, TERM='xterm-256color', PYTHONUNBUFFERED='1')
+            if scenario == 'vs16-buffered':
+                variables.pop('PYTHONUNBUFFERED', None)
             variables.pop('NO_COLOR', None)
             variables.update(env or {})
             argv = [sys.executable, str(Path(__file__).resolve()), '--child', scenario]
@@ -532,7 +680,7 @@ def operation_stream_and_long_report():
     for columns, lines in ((80, 40), (48, 20)):
         with Session('stream-output', columns=columns, lines=lines) as session:
             session.send('3\n')
-            session.expect('⚙️ Введите значение:')
+            session.expect('Введите значение:')
             screen = CSI.sub('', current_screen(session)).replace('\r', '')
             assert '✅ Готово\n☁️ Облако\n⚠️ Ошибка\n' in screen, screen
             assert 'PATH=/root/a  b/key.pem' in screen, screen
@@ -557,6 +705,80 @@ def operation_stream_and_long_report():
             session.finish()
 
 
+def narrow_vs16_cursor_cells():
+    for columns, lines in ((80, 40), (48, 20)):
+        for capability in ({}, {'no_color': True}, {'env': {'NO_COLOR': '1'}}):
+            with Session('vs16-output', columns=columns, lines=lines, **capability) as session:
+                for glyph in ('⚙️', '🗑️', '☁️', '⬅️'):
+                    assert_vs16_geometry(current_screen(session), glyph, columns, lines)
+                session.send('6\n')
+                session.expect(PROMPT)
+                assert_vs16_geometry(current_screen(session), '☁️', columns, lines)
+                session.send('0\n')
+                session.expect(PROMPT)
+                session.send('3\n')
+                session.expect('Введите значение:')
+                raw = current_screen(session)
+                for glyph in ('⚙️', '🗑️', '☁️'):
+                    assert_vs16_geometry(raw, glyph, columns, lines)
+                if capability:
+                    assert not SGR.search(session.output), 'Color emitted in no-color mode'
+                session.send('\n')
+                session.expect(PAUSE)
+                session.send('\n')
+                session.expect(PROMPT)
+                session.send('0\n')
+                session.finish()
+
+
+def vertical_install_modes():
+    for columns, lines in ((80, 40), (48, 20)):
+        for mode, marker in (('0', 'MODE_CANCELLED'), ('2', 'MODE_GUIDE')):
+            with Session('install-mode', columns=columns, lines=lines) as session:
+                session.send('1\n')
+                session.expect('Режим')
+                session.expect('[1]:')
+                raw = current_screen(session)
+                plain = CSI.sub('', raw).replace('\r', '')
+                assert 'Режим установки' in plain, plain
+                options = [line for line in plain.splitlines() if re.match(r'^\s*[120]\)', line)]
+                assert [re.match(r'^\s*([120])\)', line).group(1) for line in options] == ['1', '2', '0'], plain
+                for number in ('1', '2', '0'):
+                    assert re.search(r'\x1b\[1m\s*' + number + r'\x1b\[0m\)', raw), raw
+                assert_shared_header(raw, columns)
+                session.send(mode + '\n')
+                session.expect(marker)
+                session.expect(PAUSE)
+                session.send('\n')
+                session.expect(PROMPT)
+                session.send('0\n')
+                session.finish()
+
+
+def streaming_vs16_edge_and_buffer_order():
+    for columns, lines in ((80, 40), (48, 20)):
+        for scenario in ('vs16-edge', 'vs16-buffered'):
+            with Session(scenario, columns=columns, lines=lines) as session:
+                session.send('3\n')
+                if scenario == 'vs16-buffered':
+                    session.expect('Введите значение:')
+                else:
+                    session.expect(PAUSE)
+                raw = current_screen(session)
+                glyphs = ('⚙️', '☁️', '🗑️', '⬅️') if scenario == 'vs16-edge' else ('⚙️', '☁️', '🗑️')
+                for glyph in glyphs:
+                    assert_vs16_geometry(raw, glyph, columns, lines)
+                if scenario == 'vs16-buffered':
+                    assert '☁️ Облако' in CSI.sub('', raw), 'Interleaved streams reordered buffered bytes'
+                    session.send('\n')
+                    session.expect(PAUSE)
+                session.send('\n')
+                session.expect(PROMPT)
+                assert '\x1b[r' in session.output
+                session.send('0\n')
+                session.finish()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--child', help=argparse.SUPPRESS)
@@ -570,7 +792,8 @@ def main():
     checks = [back_and_cancel, invalid_and_results, sequential_main_actions, operation_modes,
               input_cancel_and_operation_interrupt, eof_at_every_level,
               confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output,
-              shared_headers_direct_docker_and_operation_regions, operation_stream_and_long_report]
+              shared_headers_direct_docker_and_operation_regions, operation_stream_and_long_report,
+              narrow_vs16_cursor_cells, vertical_install_modes, streaming_vs16_edge_and_buffer_order]
     for check in checks:
         check()
         print('PASS ' + check.__name__, flush=True)

@@ -263,13 +263,15 @@ def test_summary_fragment_styles_keep_values_neutral_and_domain_bold_cyan(app, u
     monkeypatch.delenv('NO_COLOR', raising=False)
     ui.draw(ui.Terminal(), app, 'main')
     text = output.getvalue()
+    # Cursor placement may appear inside styled emoji labels; SGR stays intact.
+    styled = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', lambda match: match.group(0) if match.group(0).endswith('m') else '', text)
     for label in ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка'):
         assert '\x1b[1m' + label + ':\x1b[0m' in text
     assert '\x1b[1;36mexample.com\x1b[0m' in text
     assert '\x1b[32m' not in text and '\x1b[33m' not in text and '\x1b[31m' not in text
     assert 'node · Ubuntu' not in text
     for heading, _ in ui.GROUPS:
-        assert '\x1b[1m' + ui.clean(heading) + '\x1b[0m' in text
+        assert '\x1b[1m' + ui.clean(heading) + '\x1b[0m' in styled
     assert re.search(r'\x1b\[1m\s*10\x1b\[0m\)', text)
 
 
@@ -378,11 +380,11 @@ def test_operation_stream_uses_one_emoji_space_preserves_lines_ansi_and_payload(
     monkeypatch.setattr(app, 'perform', operation)
     inputs(monkeypatch, ['3', '', '0'])
     assert ui.run(app, args()) == 0
-    text = output.getvalue()
+    text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output.getvalue())
     assert '✅ Готово\n☁️ Облако\n' in text
     assert 'PATH=/root/a  b/key.pem\n' in text
     assert '{"target":"127.0.0.1:9443", "note":"a  b"}\n' in text
-    assert re.sub(r'\x1b\[[0-9;]*m', '', errors.getvalue()) == '⚠️ Ошибка\n'
+    assert re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', errors.getvalue()) == '⚠️ Ошибка\n'
     assert '\x1b[33m' in errors.getvalue() and '\x1b[0m' in errors.getvalue()
     assert sys.stdout is output and sys.stderr is errors, 'Stream wrappers must be restored on return'
 
@@ -414,4 +416,180 @@ def test_operation_stream_preserves_emoji_clusters_across_write_boundaries(app, 
     monkeypatch.setattr(app, 'perform', operation)
     inputs(monkeypatch, ['3', '', '0'])
     assert ui.run(app, args()) == 0
-    assert expected + '\n' in output.getvalue()
+    assert expected + '\n' in re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output.getvalue())
+
+
+@pytest.fixture
+def vt_oracle():
+    spec = importlib.util.spec_from_file_location('offline_pty_oracle', ROOT / 'tests/pty_menu_check.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_narrow_emoji_oracle_detects_overhang_and_standard_vt_correction(vt_oracle):
+    with pytest.raises(AssertionError, match='effective blank cells'):
+        vt_oracle.assert_vs16_geometry('⚙️ Настройки', '⚙️')
+    # CHA is a standard absolute column command; the oracle does not require
+    # production to choose this command rather than CUF/CUP or another placement.
+    vt_oracle.assert_vs16_geometry('⚙️\x1b[3G Настройки', '⚙️')
+
+
+@pytest.mark.parametrize('size', [(80, 40), (48, 20)])
+@pytest.mark.parametrize('no_color', [False, True])
+@pytest.mark.parametrize('screen,glyph', [('main', '⚙️'), ('main', '🗑️'), ('main', '☁️'), ('main', '⬅️'), ('sites', '☁️')])
+def test_vs16_has_one_visible_blank_cell_in_menu_summary_and_sites(app, ui, monkeypatch, vt_oracle, size, no_color, screen, glyph):
+    import client_panel
+    original = client_panel.snapshot
+    def snapshot(controller):
+        value = original(controller)
+        value['rows'] = [(label, '☁️ Облако' if label == 'Заглушка' else text) for label, text in value['rows']]
+        return value
+    monkeypatch.setattr(client_panel, 'snapshot', snapshot)
+    monkeypatch.setenv('TERM', 'xterm-256color')
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda *_: size)
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    ui.draw(ui.Terminal(no_color=no_color), app, screen)
+    vt_oracle.assert_vs16_geometry(output.getvalue(), glyph, *size)
+    if no_color:
+        assert not re.search(r'\x1b\[[0-9;]*m', output.getvalue())
+
+
+@pytest.mark.parametrize('mode', ['no-color', 'NO_COLOR', 'dumb', 'redirect'])
+def test_vs16_capabilities_keep_placement_with_no_color_and_plain_fallback(ui, monkeypatch, vt_oracle, mode):
+    output = io.StringIO() if mode == 'redirect' else Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'dumb' if mode == 'dumb' else 'xterm')
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    if mode == 'NO_COLOR':
+        monkeypatch.setenv('NO_COLOR', '1')
+    ui.Terminal(no_color=mode == 'no-color').line('⚙️ Настройки')
+    raw = output.getvalue()
+    assert re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', raw) == '⚙️ Настройки\n'
+    assert not re.search(r'\x1b\[[0-9;]*m', raw)
+    if mode in ('no-color', 'NO_COLOR'):
+        vt_oracle.assert_vs16_geometry(raw, '⚙️')
+    else:
+        assert '\x1b' not in raw
+
+
+@pytest.mark.parametrize('size', [(80, 40), (48, 20)])
+@pytest.mark.parametrize('chunks', [('☁', '\ufe0f', ' Облако\n'), ('🗑', '\ufe0f', ' Удаление\n'),
+                                   ('⚙', '\ufe0f', '\x1b[33m', ' Настройки', '\x1b[0m', '\n')])
+def test_operation_vs16_cursor_placement_survives_partial_writes(app, ui, monkeypatch, vt_oracle, size, chunks):
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda *_: size)
+    seen = []
+    def operation(_):
+        begin = len(output.getvalue())
+        for chunk in chunks:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+        seen.append(output.getvalue()[begin:])
+    monkeypatch.setattr(app, 'perform', operation)
+    inputs(monkeypatch, ['3', '', '0'])
+    assert ui.run(app, args()) == 0
+    glyph = chunks[0] + '\ufe0f'
+    vt_oracle.assert_vs16_geometry(seen[0], glyph, *size)
+    plain = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', seen[0])
+    assert plain == re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', ''.join(chunks))
+
+
+@pytest.mark.parametrize('width', [8, 48, 80])
+@pytest.mark.parametrize('glyph', ['⚙️', '☁️', '🗑️', '⬅️'])
+@pytest.mark.parametrize('chunked', [False, True])
+def test_streaming_vs16_wraps_whole_glyph_before_last_cell(ui, monkeypatch, vt_oracle, width, glyph, chunked):
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda *_: (width, 40))
+    terminal = ui.Terminal(no_color=True)
+    prefix = 'x' * (width - 2) + ' '
+    with ui.operation_output(terminal, 7):
+        start = len(output.getvalue())
+        text = prefix + glyph + ' A\n'
+        for chunk in text if chunked else (text,):
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+        raw = output.getvalue()[start:]
+    for advance in (1, 2):
+        emulator = vt_oracle.NarrowEmojiTerminal(width, 40, advance).feed(raw)
+        emulator.assert_gap(glyph)
+        icon = next(item for item in emulator.draws if item['glyph'] == glyph)
+        assert (icon['row'], icon['column']) == (1, 0), 'Two-cell glyph must move wholly to next row'
+    assert '\x1b[r' in output.getvalue(), 'Scrolling region must be reset'
+    assert glyph + ' ' in vt_oracle.CSI.sub('', raw) and glyph + '  ' not in vt_oracle.CSI.sub('', raw)
+
+
+def test_partial_emoji_stdout_stderr_share_separator_and_cursor(ui, monkeypatch, vt_oracle):
+    # A real PTY merges both streams in write order. Use one sink for the unit
+    # regression so the independently replayed screen sees the same ordering.
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setattr(sys, 'stderr', output)
+    monkeypatch.setenv('TERM', 'xterm')
+    terminal = ui.Terminal(no_color=True)
+    with ui.operation_output(terminal, 7):
+        start = len(output.getvalue())
+        sys.stdout.write('☁')
+        sys.stdout.write('\ufe0f')
+        sys.stderr.write(' ')
+        sys.stdout.write('Облако\n')
+        raw = output.getvalue()[start:]
+    vt_oracle.assert_vs16_geometry(raw, '☁️')
+    assert vt_oracle.CSI.sub('', raw) == '☁️ Облако\n'
+    assert sys.stdout is output and sys.stderr is output
+
+
+@pytest.mark.parametrize('command', ['\x1b[8G', '\x1b[3C', '\x1b[2D', '\x1b[2;6H', '\x1b[2;6f'])
+def test_operation_partial_ansi_cursor_commands_preserve_vs16_gap(ui, monkeypatch, vt_oracle, command):
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'xterm')
+    terminal = ui.Terminal(no_color=True)
+    with ui.operation_output(terminal, 7):
+        start = len(output.getvalue())
+        sys.stdout.write('abcd')
+        for char in command + '☁️ A\n':
+            sys.stdout.write(char)
+        raw = output.getvalue()[start:]
+    assert command in raw, 'Existing ANSI control bytes must be preserved'
+    vt_oracle.assert_vs16_geometry(raw, '☁️')
+
+
+@pytest.mark.parametrize('mode', ['0', '2'])
+def test_install_mode_menu_is_vertical_with_bold_title_and_numbers(app, ui, monkeypatch, mode):
+    from types import SimpleNamespace
+    output = Output()
+    monkeypatch.setattr(sys, 'stdout', output)
+    monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    monkeypatch.setattr(app, 'INSTALL', app.STATE.parent / 'install')
+    monkeypatch.setattr(app, 'check_install_resources', lambda: None)
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: SimpleNamespace(
+        collect=lambda *_: {'checks': []}, display_compact=lambda *_, **__: None))
+    monkeypatch.setattr(app, 'dependencies', lambda: pytest.fail('Mode browsing must not prepare the host'))
+    monkeypatch.setattr(app, 'guide', lambda *_: None)
+    inputs(monkeypatch, [mode])
+    selected = args()
+    selected.no_color = False
+    if mode == '0':
+        with pytest.raises(app.Failure) as error:
+            app.install(selected)
+        assert error.value.code == 'CANCELLED'
+    else:
+        app.install(selected)
+    raw = output.getvalue()
+    plain = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', raw)
+    options = [line for line in plain.splitlines() if re.match(r'^\s*[120]\)', line)]
+    assert [re.match(r'^\s*([120])\)', line).group(1) for line in options] == ['1', '2', '0'], plain
+    assert any('Установить Caddy' in line for line in options)
+    assert any('Свой веб-сервер' in line for line in options)
+    assert re.search(r'\x1b\[1(?:;\d+)?m[^\n]*Режим установки', raw), raw
+    for number in ('1', '2', '0'):
+        assert re.search(r'\x1b\[1m\s*' + number + r'\x1b\[0m\)', raw), raw
+    assert not app.CONFIG.exists() and not app.STATE.exists(), 'Mode choice must not mutate installation data'

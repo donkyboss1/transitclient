@@ -6,15 +6,18 @@
 
 ## Установка
 
+Запустите в SSH-терминале от root. Если вошли обычным пользователем,
+сначала выполните `sudo -i`.
+
 ```bash
-bash -c 'set -e; installer=$(mktemp); trap "rm -f -- \"$installer\"" EXIT; curl -fsSL --proto "=https" --proto-redir "=https" https://raw.githubusercontent.com/donkyboss1/transitclient/main/install.sh -o "$installer"; if [ "$EUID" -eq 0 ]; then bash "$installer" install; else sudo bash "$installer" install; fi'
+bash <(curl -fsSL https://raw.githubusercontent.com/donkyboss1/transitclient/main/install.sh) install
 ```
 
 Мастер проверит сервер, предложит настройки и покажет план перед установкой.
 Вопросы подтверждения используют `[y/N]`; Enter отменяет действие.
 Существующие сайты, службы и чужие контейнеры автоматически не меняются.
-Команда сначала сохраняет скрипт во временный файл, чтобы меню и Ctrl+C
-работали в обычном SSH-терминале.
+Команда передаёт скрипт Bash через файловый дескриптор, сохраняя терминальный
+ввод для мастера. Установщик проверяет SHA256 и версию пакета перед запуском.
 
 ## Что понадобится
 

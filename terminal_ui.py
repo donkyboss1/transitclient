@@ -67,20 +67,6 @@ def display_width(value):
     return sum(cluster_width(group) for group in clusters(value))
 
 
-def fit(value, width):
-    text = clean(value)
-    if display_width(text) <= width:
-        return text
-    result, used = '', 0
-    for group in clusters(text):
-        size = cluster_width(group)
-        if used + size > max(0, width - 1):
-            break
-        result += group
-        used += size
-    return result + ('…' if width else '')
-
-
 def fit_fragments(fragments, width):
     """Clip plain graphemes with their roles, before any ANSI is generated."""
     prepared = [(clean(value), role) for value, role in fragments]
@@ -319,9 +305,9 @@ def operation_output(terminal, header_lines):
 
 GROUPS = [
     ('🔧 Установка и настройки', [('1', '🚀 Установка', 'install'), ('2', '⚙️ Настройки', 'settings')]),
-    ('📊 Состояние и проверки', [('3', '📊 Статус', 'status'), ('4', '🔍 Диагностика', 'diagnose'), ('5', '🧪 Самопроверка', 'tests')]),
-    ('🎨 Сайт и подключение', [('6', '🎨 Сайт-заглушка', 'sites'), ('7', '📖 Инструкция подключения', 'guide')]),
-    ('🔐 Обслуживание', [('8', '🔐 Проверить продление', 'renew'), ('9', '🔄 Обновить', 'update'), ('10', '🗑️ Удаление', 'uninstall')])]
+    ('🔍 Проверки', [('3', '🔍 Диагностика', 'diagnose'), ('4', '🧪 Самопроверка', 'tests')]),
+    ('🎨 Сайт и подключение', [('5', '🎨 Сайт-заглушка', 'sites'), ('6', '📖 Инструкция подключения', 'guide')]),
+    ('🔐 Обслуживание', [('7', '🔐 Проверить продление', 'renew'), ('8', '🔄 Обновить', 'update'), ('9', '🗑️ Удаление', 'uninstall')])]
 MENU = {number: (label, action) for _, options in GROUPS for number, label, action in options}
 OPERATIONS = {number: action for number, (_, action) in MENU.items() if action not in ('settings', 'tests', 'sites')}
 COMPACT_LABELS = {'guide': '📖 Подключение', 'renew': '🔐 Продление'}
@@ -401,7 +387,7 @@ def draw(terminal, app, screen, notice=''):
                 themes = app.template_module().catalog(app.PACKAGE)['templates']
             except (OSError, ValueError, KeyError, TypeError):
                 themes = []
-                terminal.line('Каталог недоступен → Диагностика (4).', 'error')
+                terminal.line('Каталог недоступен → Диагностика (3).', 'error')
             if compact:
                 columns(terminal, [(theme['id'], theme['name']) for theme in themes])
             else:
@@ -467,16 +453,14 @@ def run(app, args):
                 notice = 'Неизвестный пункт. Выберите действие из списка.'
                 continue
             try:
-                panel, header_lines = draw_header(terminal, app)
-                if selected.command == 'status':
-                    selected._status_panel = panel
+                _, header_lines = draw_header(terminal, app)
                 with operation_output(terminal, header_lines):
                     draw_title = TITLES.get(screen) or MENU[choice][0]
                     terminal.line(draw_title, 'bold')
                     app.perform(selected)
                     if selected.command == 'diagnose':
+                        terminal.fragments(option('1', 'Подробный отчёт') + [(' · Enter — назад', None)])
                         while True:
-                            terminal.fragments(option('1', 'Подробный отчёт') + [(' · Enter — назад', None)])
                             detail = input('Нажмите Enter для возврата или 1 для подробного отчёта: ').strip()
                             if not detail:
                                 break
@@ -485,6 +469,8 @@ def run(app, args):
                                 continue
                             selected.full = True
                             app.perform(selected)
+                            input('Нажмите Enter для возврата…')
+                            break
                         continue
                     input('Нажмите Enter для возврата…')
             except KeyboardInterrupt:

@@ -219,13 +219,6 @@ def child(scenario, no_color):
 
         def fake_perform(args):
             command = args.command
-            if scenario == 'real-status' and command == 'status':
-                app.diagnostic_module = app.verify_served = forbidden
-                before = dict(app._menu_tls_check)
-                app.status(config, interactive=True, no_color=no_color)
-                assert app._menu_tls_check == before
-                print('STATUS_NO_DIAGNOSTIC', flush=True)
-                return 0
             if scenario in ('vs16-output', 'vs16-buffered'):
                 for chunk in ('☁', '\ufe0f'):
                     sys.stdout.write(chunk)
@@ -395,7 +388,7 @@ class Session:
 
 
 def back_and_cancel():
-    for option, title in [('2', 'Настройки'), ('5', 'Самопроверка'), ('6', 'Сайт')]:
+    for option, title in [('2', 'Настройки'), ('4', 'Самопроверка'), ('5', 'Сайт')]:
         with Session() as session:
             session.send(option + '\n')
             session.expect(title)
@@ -420,7 +413,7 @@ def invalid_and_results():
             session.send(option + '\n')
             session.expect('Неизвестный')
             session.expect(PROMPT)
-        for option, marker in [('3', 'TEST_SUCCESS=status'), ('4', 'TEST_ERROR')]:
+        for option, marker in [('6', 'TEST_SUCCESS=guide'), ('3', 'TEST_ERROR')]:
             session.send(option + '\n')
             session.expect(marker)
             session.expect(PAUSE)
@@ -431,7 +424,7 @@ def invalid_and_results():
             session.expect(PROMPT)
         session.send('0\n')
         session.finish()
-    for menu in ('2', '5', '6'):
+    for menu in ('2', '4', '5'):
         with Session() as session:
             session.send(menu + '\n')
             session.expect(PROMPT)
@@ -449,7 +442,7 @@ def invalid_and_results():
 
 def sequential_main_actions():
     with Session() as session:
-        for option, command in [('3', 'status'), ('7', 'guide'), ('8', 'renew'), ('9', 'update'), ('10', 'uninstall')]:
+        for option, command in [('6', 'guide'), ('7', 'renew'), ('8', 'update'), ('9', 'uninstall')]:
             session.send(option + '\n')
             session.expect('TEST_SUCCESS=' + command)
             session.expect(PAUSE)
@@ -462,15 +455,17 @@ def sequential_main_actions():
 def diagnostic_details():
     for columns, lines in ((80, 40), (48, 20)):
         with Session(columns=columns, lines=lines) as session:
-            session.send('4\n')
+            session.send('3\n')
             session.expect('DIAGNOSTIC_FULL=False')
             session.expect('Нажмите Enter для возврата')
             session.send('bad\n')
             session.expect('Неизвестный пункт')
             session.expect('Нажмите Enter для возврата')
+            full_start = len(session.output)
             session.send('1\n')
             session.expect('DIAGNOSTIC_FULL=True')
             session.expect('Нажмите Enter для возврата')
+            assert 'Подробный отчёт' not in session.output[full_start:]
             assert_shared_header(current_screen(session), columns)
             session.send('\n')
             session.expect(PROMPT)
@@ -479,29 +474,9 @@ def diagnostic_details():
             session.finish()
 
 
-def real_status_output():
-    for columns, lines in ((80, 40), (48, 20)):
-        with Session('real-status', columns=columns, lines=lines) as session:
-            session.send('3\n')
-            session.expect('STATUS_NO_DIAGNOSTIC')
-            session.expect(PAUSE)
-            raw = current_screen(session)
-            assert_shared_header(raw, columns)
-            plain = CSI.sub('', raw)
-            for label in ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка'):
-                assert plain.count(label + ':') == 1, (columns, label, plain)
-            assert 'Состояние показано в верхней сводке.' in plain
-            assert 'Диагностика transitclient' not in plain
-            assert '\x1b[1;36mnode.example.com\x1b[0m' in raw
-            session.send('\n')
-            session.expect(PROMPT)
-            session.send('0\n')
-            session.finish()
-
-
 def operation_modes():
     with Session() as session:
-        session.send('5\n')
+        session.send('4\n')
         session.expect(PROMPT)
         for option, marker in [('1', 'local'), ('2', 'http01'), ('3', 'vpn')]:
             session.send(option + '\n')
@@ -511,7 +486,7 @@ def operation_modes():
             session.expect(PROMPT)
         session.send('0\n')
         session.expect(PROMPT)
-        session.send('6\n')
+        session.send('5\n')
         session.expect(PROMPT)
         assert '11' in session.output
         for option, marker in [('i', 'builtin'), ('r', 'random'), ('b', 'rollback')]:
@@ -549,7 +524,7 @@ def input_cancel_and_operation_interrupt():
         session.send('0\n')
         session.finish()
     with Session('interrupt-operation') as session:
-        session.send('8\n')
+        session.send('7\n')
         session.expect('OPERATION_RUNNING')
         session.send('\x03')
         session.expect('ROLLBACK_FINISHED')
@@ -561,13 +536,13 @@ def input_cancel_and_operation_interrupt():
 
 
 def eof_at_every_level():
-    for path in ([], ['2'], ['5'], ['6'], ['2', '1'], ['2', '4'], ['3'], ['1']):
+    for path in ([], ['2'], ['4'], ['5'], ['2', '1'], ['2', '4'], ['6'], ['1']):
         with Session() as session:
             for index, option in enumerate(path):
                 session.send(option + '\n')
                 if path in (['2', '1'], ['2', '4']) and index == 1:
                     session.expect('Новое значение:')
-                elif option == '3':
+                elif path == ['6']:
                     session.expect(PAUSE)
                 elif option == '1':
                     session.expect('[y/N]')
@@ -575,7 +550,7 @@ def eof_at_every_level():
                     session.expect(PROMPT)
             session.send('\x04')
             session.finish()
-            if path in (['2', '1'], ['2', '4'], ['3'], ['1']):
+            if path in (['2', '1'], ['2', '4'], ['6'], ['1']):
                 assert '\x1b[r' in session.output, 'Scroll region must reset after EOF'
 
 
@@ -598,7 +573,7 @@ def terminal_capabilities_and_layout():
                    {'env': {'NO_COLOR': '1'}}, {'env': {'TERM': 'dumb'}}):
         with Session(**kwargs) as session:
             for _ in range(2):
-                session.send('5\n')
+                session.send('4\n')
                 session.expect(PROMPT)
                 session.send('0\n')
                 session.expect(PROMPT)
@@ -616,10 +591,11 @@ def terminal_capabilities_and_layout():
                 assert len(screen.splitlines()) <= kwargs.get('lines', 40), screen
                 for line in screen.splitlines():
                     assert line_width(line) <= kwargs.get('columns', 80), repr(line)
-                for number in ('1)', '2)', '3)', '4)', '5)', '6)', '7)', '8)', '9)', '10)', '0)'):
+                for number in ('1)', '2)', '3)', '4)', '5)', '6)', '7)', '8)', '9)', '0)'):
                     assert number in screen, screen
                 options = [line for line in screen.splitlines() if re.match(r'^\s*\d+\)', line)]
-                assert re.findall(r'\b(\d+)\)', '\n'.join(options)) == [str(i) for i in range(1, 11)] + ['0'], options
+                assert re.findall(r'\b(\d+)\)', '\n'.join(options)) == [str(i) for i in range(1, 10)] + ['0'], options
+                assert 'Статус' not in screen, screen
                 assert 'pty-host' not in screen and 'Ubuntu' not in screen, screen
                 assert 'Сервер:' in screen and 'Caddy ·' in screen and 'Заглушка:' in screen, screen
                 assert 'Таймер включён' not in screen and 'Включено' in screen, screen
@@ -683,7 +659,7 @@ def shared_headers_direct_docker_and_operation_regions():
     for columns, lines in ((80, 40), (48, 20)):
         with Session(columns=columns, lines=lines) as session:
             assert_shared_header(current_screen(session), columns)
-            for option in ('2', '5', '6'):
+            for option in ('2', '4', '5'):
                 session.send(option + '\n')
                 session.expect(PROMPT)
                 screen = current_screen(session)
@@ -706,8 +682,8 @@ def shared_headers_direct_docker_and_operation_regions():
             assert '\x1b[r' in session.output, 'Scroll region must reset before returning to settings'
             session.send('0\n')
             session.expect(PROMPT)
-            for choice, marker in [('3', 'TEST_SUCCESS=status'), ('4', 'TEST_ERROR'), ('7', 'TEST_SUCCESS=guide'),
-                                   ('8', 'TEST_SUCCESS=renew'), ('9', 'TEST_SUCCESS=update'), ('10', 'TEST_SUCCESS=uninstall')]:
+            for choice, marker in [('3', 'TEST_ERROR'), ('6', 'TEST_SUCCESS=guide'),
+                                   ('7', 'TEST_SUCCESS=renew'), ('8', 'TEST_SUCCESS=update'), ('9', 'TEST_SUCCESS=uninstall')]:
                 session.send(choice + '\n')
                 session.expect(marker)
                 session.expect(PAUSE)
@@ -727,7 +703,7 @@ def shared_headers_direct_docker_and_operation_regions():
 def operation_stream_and_long_report():
     for columns, lines in ((80, 40), (48, 20)):
         with Session('stream-output', columns=columns, lines=lines) as session:
-            session.send('3\n')
+            session.send('6\n')
             session.expect('Введите значение:')
             screen = CSI.sub('', current_screen(session)).replace('\r', '')
             assert '✅ Готово\n☁️ Облако\n⚠️ Ошибка\n' in screen, screen
@@ -739,7 +715,7 @@ def operation_stream_and_long_report():
             session.send('0\n')
             session.finish()
         with Session('long-output', columns=columns, lines=lines) as session:
-            session.send('3\n')
+            session.send('6\n')
             session.expect('REPORT_LINE=74')
             session.expect(PAUSE)
             raw = current_screen(session)
@@ -759,12 +735,12 @@ def narrow_vs16_cursor_cells():
             with Session('vs16-output', columns=columns, lines=lines, **capability) as session:
                 for glyph in ('⚙️', '🗑️', '☁️', '⬅️'):
                     assert_vs16_geometry(current_screen(session), glyph, columns, lines)
-                session.send('6\n')
+                session.send('5\n')
                 session.expect(PROMPT)
                 assert_vs16_geometry(current_screen(session), '☁️', columns, lines)
                 session.send('0\n')
                 session.expect(PROMPT)
-                session.send('3\n')
+                session.send('6\n')
                 session.expect('Введите значение:')
                 raw = current_screen(session)
                 for glyph in ('⚙️', '🗑️', '☁️'):
@@ -807,7 +783,7 @@ def streaming_vs16_edge_and_buffer_order():
     for columns, lines in ((80, 40), (48, 20)):
         for scenario in ('vs16-edge', 'vs16-buffered'):
             with Session(scenario, columns=columns, lines=lines) as session:
-                session.send('3\n')
+                session.send('6\n')
                 if scenario == 'vs16-buffered':
                     session.expect('Введите значение:')
                 else:
@@ -837,7 +813,7 @@ def main():
         return
     if os.name != 'posix':
         parser.error('Run in Linux/WSL: python3 tests/pty_menu_check.py')
-    checks = [back_and_cancel, invalid_and_results, sequential_main_actions, diagnostic_details, real_status_output, operation_modes,
+    checks = [back_and_cancel, invalid_and_results, sequential_main_actions, diagnostic_details, operation_modes,
               input_cancel_and_operation_interrupt, eof_at_every_level,
               confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output,
               shared_headers_direct_docker_and_operation_regions, operation_stream_and_long_report,

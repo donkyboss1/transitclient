@@ -1455,31 +1455,32 @@ def saved_status(config):
     return report
 
 
-def status(config, diagnose=False, json_output=False, interactive=False, full=False, no_color=False, panel=None):
+def status(config, json_output=False, no_color=False):
+    """Standalone CLI snapshot; the menu already shows these seven rows."""
     report = saved_status(config)
-    if not diagnose:
-        import client_panel
-        import terminal_ui
-        if panel is None:
-            app = SimpleNamespace(**globals())
-            app.safe_config = lambda: config
-            panel = client_panel.snapshot(app)
-        report['summary'] = dict(panel['rows'])
-        report['installation']['state'] = panel['installation']
-        if json_output:
-            print(json.dumps(report, ensure_ascii=False, indent=2))
-        else:
-            terminal = terminal_ui.Terminal(no_color=no_color)
-            if interactive:
-                terminal.line('Состояние показано в верхней сводке.')
-            else:
-                terminal.line('📊 Transit Client · ' + report['installation']['version'], 'bold')
-                terminal_ui.draw_rows(terminal, panel['rows'])
-            if report['pending']:
-                terminal.line('⚠️ Есть незавершённая операция → Диагностика.', 'warning')
-            elif panel['installation'] in ('broken', 'incomplete'):
-                terminal.line('⚠️ ' + panel['hint'], 'warning')
-        return report
+    import client_panel
+    import terminal_ui
+    app = SimpleNamespace(**globals())
+    app.safe_config = lambda: config
+    panel = client_panel.snapshot(app)
+    report['summary'] = dict(panel['rows'])
+    report['installation']['state'] = panel['installation']
+    if json_output:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        terminal = terminal_ui.Terminal(no_color=no_color)
+        terminal.line('📊 Transit Client · ' + report['installation']['version'], 'bold')
+        terminal_ui.draw_rows(terminal, panel['rows'])
+        if report['pending']:
+            terminal.line('⚠️ Есть незавершённая операция → Диагностика.', 'warning')
+        elif panel['installation'] in ('broken', 'incomplete'):
+            terminal.line('⚠️ ' + panel['hint'], 'warning')
+    return report
+
+
+def diagnose(config, json_output=False, interactive=False, full=False, no_color=False):
+    """Collect inventory and verify HTTPS only for explicitly requested checks."""
+    report = saved_status(config)
     diagnostics = diagnostic_module()
     inventory = diagnostics.collect(config)
     report['checks'] = inventory['checks'] + report['checks']
@@ -1501,7 +1502,7 @@ def status(config, diagnose=False, json_output=False, interactive=False, full=Fa
     verified_identity = None
     if config and (STATE / 'certificate-transaction.json').exists():
         report['checks'].append({'code': 'CERT_SWITCH_PENDING', 'status': 'unknown',
-                                 'message': 'Переключение сертификата не завершено; status не запускает recovery.'})
+                                 'message': 'Переключение сертификата не завершено; диагностика не запускает recovery.'})
     elif config:
         if interactive:
             import client_panel
@@ -1529,7 +1530,7 @@ def status(config, diagnose=False, json_output=False, interactive=False, full=Fa
     if not full:
         diagnostics.display(report, no_color=no_color)
         return report
-    print('📊 transitclient · ' + report['installation']['version'])
+    print('🔍 Подробный отчёт · Transit Client · ' + report['installation']['version'])
     if config:
         print(f"Домен: {config['domain']}; VPN: {config.get('vpn_port') or 'не подтверждён'}; "
               f"HTTP: {config['challenge_port']}; HTTPS target: {target(config)}")
@@ -1538,7 +1539,9 @@ def status(config, diagnose=False, json_output=False, interactive=False, full=Fa
     else:
         print('Установка ещё не настроена.' if not CONFIG.exists() else '❌ CONFIG_INVALID: сохранённая конфигурация повреждена; автоматическое исправление не выполняется.')
     print('Сертификат: ' + json.dumps(report['installation']['certificate'], ensure_ascii=False))
-    print('Сайт: ' + json.dumps(report['installation']['site'], ensure_ascii=False))
+    import client_panel
+    site = report['installation']['site']
+    print('Сайт: ' + client_panel.sanitize(site.get('name', 'неизвестно')))
     print('Последняя операция: ' + json.dumps(report['last_operation'], ensure_ascii=False))
     print('Незавершённые ресурсы: ' + (', '.join(report['pending']) or 'нет'))
     for unit, values in report['units'].items():
@@ -1784,14 +1787,12 @@ def dispatch(args):
             raise Failure('Сначала завершите установку.', 'NOT_INSTALLED')
         local_self_test(config)
         return 0
-    if command in ('status', 'diagnose', 'self-test') and not args.http01 and not args.vpn:
-        if interactive:
-            report = status(safe_config(), command != 'status', False, interactive=True,
-                            full=getattr(args, 'full', False), no_color=getattr(args, 'no_color', False),
-                            panel=getattr(args, '_status_panel', None))
-        else:
-            report = status(safe_config(), command != 'status', args.json,
-                            full=getattr(args, 'full', False), no_color=getattr(args, 'no_color', False))
+    if command == 'status':
+        status(safe_config(), json_output=args.json, no_color=getattr(args, 'no_color', False))
+        return 0
+    if command in ('diagnose', 'self-test') and not args.http01 and not args.vpn:
+        report = diagnose(safe_config(), json_output=args.json, interactive=interactive,
+                          full=getattr(args, 'full', False), no_color=getattr(args, 'no_color', False))
         return 1 if command == 'self-test' and any(item['status'] == 'error' for item in report['checks']) else 0
     if command == 'guide':
         guide(safe_config(), interactive=True) if interactive else guide(safe_config())

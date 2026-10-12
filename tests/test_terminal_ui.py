@@ -30,7 +30,7 @@ def ui(monkeypatch):
                  ('Домен', 'example.com'), ('Порты', 'VPN 443 · HTTP 8080 · HTTPS 127.0.0.1:9443'),
                  ('SSL', '✅ Действителен · 25 дней · issuer'), ('HTTPS', 'Не подтверждён'),
                  ('Продление', '✅ Включено'), ('Заглушка', 'Встроенная страница')],
-        'hint': 'HTTPS не подтверждён → Самопроверка (5).',
+        'hint': 'HTTPS не подтверждён → Самопроверка (4).',
         'config': {'domain': 'example.com', 'challenge_port': 8080, 'vpn_port': 443,
                    'local_port': 9443}})
     monkeypatch.setattr(sys, 'stdin', type('TTY', (), {'isatty': lambda _: True})())
@@ -55,23 +55,25 @@ def inputs(monkeypatch, values):
 def test_diagnostic_full_report_and_invalid_selection(app, ui, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(app, 'perform', lambda selected: calls.append((selected.command, selected.full)) or 0)
-    inputs(monkeypatch, ['4', 'bad', '1', '', '3', '', '0'])
+    inputs(monkeypatch, ['3', 'bad', '1', '', '6', '', '0'])
     ui.run(app, args())
-    assert calls == [('diagnose', False), ('diagnose', True), ('status', False)]
+    assert calls == [('diagnose', False), ('diagnose', True), ('guide', False)]
     output = capsys.readouterr().out
     assert 'Подробный отчёт' in output and 'Неизвестный пункт' in output
+    assert output.count('Подробный отчёт') == 1
 
 
 @pytest.mark.parametrize('signal', [KeyboardInterrupt(), EOFError()])
-def test_diagnostic_detail_prompt_handles_cancel_and_eof(app, ui, monkeypatch, signal):
+@pytest.mark.parametrize('full', [False, True])
+def test_diagnostic_detail_prompt_handles_cancel_and_eof(app, ui, monkeypatch, signal, full):
     calls = []
     monkeypatch.setattr(app, 'perform', lambda selected: calls.append(selected.full) or 0)
-    inputs(monkeypatch, ['4', signal, '0'])
+    inputs(monkeypatch, ['3'] + (['1'] if full else []) + [signal, '0'])
     assert ui.run(app, args()) == 0
-    assert calls == [False]
+    assert calls == ([False, True] if full else [False])
 
 
-@pytest.mark.parametrize('submenu', ['2', '5', '6'])
+@pytest.mark.parametrize('submenu', ['2', '4', '5'])
 def test_view_and_back_never_perform(app, ui, monkeypatch, submenu):
     monkeypatch.setattr(app, 'perform', lambda _: pytest.fail('Browsing cannot perform'))
     inputs(monkeypatch, [submenu, '0', '0'])
@@ -93,15 +95,15 @@ def test_docker_settings_cancel_returns_to_main(app, ui, monkeypatch, capsys):
 def test_invalid_and_empty_remain_on_screen(app, ui, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(app, 'perform', lambda selected: calls.append(selected.command) or 0)
-    inputs(monkeypatch, ['', 'bad', '5', '', 'bad', '0', '0'])
+    inputs(monkeypatch, ['', 'bad', '4', '', 'bad', '0', '0'])
     ui.run(app, args())
     assert calls == []
     assert capsys.readouterr().out.count('Неизвестный пункт') == 4
 
 
 @pytest.mark.parametrize('sequence', [
-    [EOFError()], ['2', EOFError()], ['5', '1', EOFError()],
-    ['3', EOFError()], ['6', EOFError()]])
+    [EOFError()], ['2', EOFError()], ['4', '1', EOFError()],
+    ['6', EOFError()], ['5', EOFError()]])
 def test_eof_exits_once(app, ui, monkeypatch, sequence):
     monkeypatch.setattr(app, 'perform', lambda _: 0)
     inputs(monkeypatch, sequence)
@@ -111,13 +113,13 @@ def test_eof_exits_once(app, ui, monkeypatch, sequence):
 def test_action_result_waits_for_enter(app, ui, monkeypatch):
     events = []
     monkeypatch.setattr(app, 'perform', lambda selected: events.append(selected.command) or 1)
-    answers = iter(['3', '', '0'])
+    answers = iter(['6', '', '0'])
     def read(prompt):
         events.append(prompt)
         return next(answers)
     monkeypatch.setattr('builtins.input', read)
     ui.run(app, args())
-    assert events == ['Выберите действие: ', 'status',
+    assert events == ['Выберите действие: ', 'guide',
                       'Нажмите Enter для возврата…', 'Выберите действие: ']
 
 
@@ -138,7 +140,7 @@ def test_operation_interrupt_finishes_cleanup_then_returns_parent(app, ui, monke
 def test_site_aliases_do_not_change_cli_mapping(app, ui, monkeypatch):
     choices = []
     monkeypatch.setattr(app, 'perform', lambda selected: choices.append(selected.template) or 0)
-    inputs(monkeypatch, ['6', 'i', '', 'r', '', 'b', '', '11', '', '0', '0'])
+    inputs(monkeypatch, ['5', 'i', '', 'r', '', 'b', '', '11', '', '0', '0'])
     ui.run(app, args())
     assert choices == ['builtin', 'random', 'rollback', '11']
     assert app.select_template('0') == 'builtin'
@@ -148,10 +150,10 @@ def test_selftest_flags_are_isolated(app, ui, monkeypatch):
     choices = []
     monkeypatch.setattr(app, 'perform', lambda selected:
                         choices.append((selected.command, selected.http01, selected.vpn)) or 0)
-    inputs(monkeypatch, ['5', '2', '', '3', '', '1', '', '0', '3', '', '0'])
+    inputs(monkeypatch, ['4', '2', '', '3', '', '1', '', '0', '6', '', '0'])
     ui.run(app, args())
     assert choices == [('self-test', True, False), ('self-test', False, True),
-                       ('self-test', False, False), ('status', False, False)]
+                       ('self-test', False, False), ('guide', False, False)]
 
 
 def test_many_transitions_use_constant_call_depth(app, ui, monkeypatch):
@@ -162,7 +164,7 @@ def test_many_transitions_use_constant_call_depth(app, ui, monkeypatch):
             frame, depth = frame.f_back, depth + 1
         depths.append(depth)
         return next(answers)
-    answers = iter(['2', '0', '5', '0', '6', '0'] * 50 + ['0'])
+    answers = iter(['2', '0', '4', '0', '5', '0'] * 50 + ['0'])
     monkeypatch.setattr('builtins.input', read)
     monkeypatch.setattr(app, 'perform', lambda _: pytest.fail('Browsing must not mutate'))
     assert ui.run(app, args()) == 0
@@ -231,7 +233,7 @@ def test_menu_fits_and_all_actions_remain(ui, app, monkeypatch, width, height, s
     text = output.getvalue().replace('\x1b[2J\x1b[H', '')
     assert len(text.splitlines()) + 1 <= height
     assert all(ui.display_width(line) <= width for line in text.splitlines())
-    for number in range(12 if screen == 'sites' else 11):
+    for number in range(12 if screen == 'sites' else 10):
         assert str(number) + ')' in text
 
 
@@ -250,8 +252,8 @@ def test_confirmation_preserves_interrupt_signal(app, monkeypatch, error):
         app.confirm('Подтвердить?')
 
 
-@pytest.mark.parametrize('choice,command', [('1', 'install'), ('3', 'status'), ('4', 'diagnose'),
-                                          ('7', 'guide'), ('8', 'renew'), ('9', 'update'), ('10', 'uninstall')])
+@pytest.mark.parametrize('choice,command', [('1', 'install'), ('3', 'diagnose'),
+                                          ('6', 'guide'), ('7', 'renew'), ('8', 'update'), ('9', 'uninstall')])
 def test_main_number_dispatch_matches_visual_order(app, ui, monkeypatch, choice, command):
     called = []
     monkeypatch.setattr(app, 'perform', lambda selected: called.append(selected.command) or 0)
@@ -270,7 +272,8 @@ def test_main_menu_numbers_are_sequential_in_row_major_order(app, ui, monkeypatc
     text = output.getvalue()
     option_lines = [line for line in text.splitlines() if re.search(r'\b\d+\)', line)]
     option_lines = [line for line in option_lines if re.match(r'^\s*\d+\)', line)]
-    assert re.findall(r'\b(\d+)\)', '\n'.join(option_lines)) == [str(number) for number in range(1, 11)] + ['0']
+    assert re.findall(r'\b(\d+)\)', '\n'.join(option_lines)) == [str(number) for number in range(1, 10)] + ['0']
+    assert 'Статус' not in text
     assert all(line[:4].endswith(')') for line in option_lines)
 
 
@@ -291,7 +294,7 @@ def test_summary_fragment_styles_keep_values_neutral_and_domain_bold_cyan(app, u
     assert 'node · Ubuntu' not in text
     for heading, _ in ui.GROUPS:
         assert '\x1b[1m' + ui.clean(heading) + '\x1b[0m' in styled
-    assert re.search(r'\x1b\[1m\s*10\x1b\[0m\)', text)
+    assert re.search(r'\x1b\[1m\s*9\x1b\[0m\)', text)
 
 
 @pytest.mark.parametrize('value,expected', [('⚙️Настройки', '⚙️ Настройки'), ('🗑️Удаление', '🗑️ Удаление'),
@@ -342,8 +345,8 @@ def test_same_summary_is_kept_on_every_submenu(app, ui, monkeypatch, size):
 
 
 @pytest.mark.parametrize('size', [(80, 40), (48, 20)])
-@pytest.mark.parametrize('path', [('1',), ('3',), ('4',), ('7',), ('8',), ('9',), ('10',),
-                                ('2', '1'), ('2', '4'), ('5', '1'), ('5', '2'), ('5', '3'), ('6', 'i')])
+@pytest.mark.parametrize('path', [('1',), ('3',), ('6',), ('7',), ('8',), ('9',),
+                                ('2', '1'), ('2', '4'), ('4', '1'), ('4', '2'), ('4', '3'), ('5', 'i')])
 def test_operation_keeps_shared_header_before_action(app, ui, monkeypatch, size, path):
     output = Output()
     monkeypatch.setattr(sys, 'stdout', output)
@@ -361,7 +364,7 @@ def test_operation_keeps_shared_header_before_action(app, ui, monkeypatch, size,
     visible = seen[0]
     assert 'Transit Client · ' + (app.PACKAGE / 'VERSION').read_text().strip() in visible
     assert [line.split(':', 1)[0] for line in summary_lines(visible)] == list(SUMMARY_LABELS)
-    assert not re.search(r'\b(?:1|2|3|10)\)', visible), 'Action header must not include the menu list'
+    assert not re.search(r'\b(?:1|2|3|9)\)', visible), 'Action header must not include the menu list'
 
 
 def test_settings_explains_port_purpose_and_exposes_docker_directly(app, ui, monkeypatch):
@@ -397,7 +400,7 @@ def test_operation_stream_uses_one_emoji_space_preserves_lines_ansi_and_payload(
         sys.stderr.write('⚠️\x1b[33m  Ошибка\x1b[0m\n')
         return 1
     monkeypatch.setattr(app, 'perform', operation)
-    inputs(monkeypatch, ['3', '', '0'])
+    inputs(monkeypatch, ['6', '', '0'])
     assert ui.run(app, args()) == 0
     text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output.getvalue())
     assert '✅ Готово\n☁️ Облако\n' in text
@@ -417,7 +420,7 @@ def test_operation_stream_is_restored_after_cancel_or_eof(app, ui, monkeypatch, 
         sys.stdout.write('☁️')
         raise error
     monkeypatch.setattr(app, 'perform', operation)
-    inputs(monkeypatch, ['3', '0'])
+    inputs(monkeypatch, ['6', '0'])
     assert ui.run(app, args()) == 0
     assert sys.stdout is output and sys.stderr is errors
     assert '☁️' in output.getvalue(), 'Partial output must not be lost on cancel'
@@ -433,7 +436,7 @@ def test_operation_stream_preserves_emoji_clusters_across_write_boundaries(app, 
             sys.stdout.write(char)
             sys.stdout.flush()
     monkeypatch.setattr(app, 'perform', operation)
-    inputs(monkeypatch, ['3', '', '0'])
+    inputs(monkeypatch, ['6', '', '0'])
     assert ui.run(app, args()) == 0
     assert expected + '\n' in re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output.getvalue())
 
@@ -510,7 +513,7 @@ def test_operation_vs16_cursor_placement_survives_partial_writes(app, ui, monkey
             sys.stdout.flush()
         seen.append(output.getvalue()[begin:])
     monkeypatch.setattr(app, 'perform', operation)
-    inputs(monkeypatch, ['3', '', '0'])
+    inputs(monkeypatch, ['6', '', '0'])
     assert ui.run(app, args()) == 0
     glyph = chunks[0] + '\ufe0f'
     vt_oracle.assert_vs16_geometry(seen[0], glyph, *size)

@@ -1389,8 +1389,22 @@ def test_diagnose_does_not_cache_replaced_unverified_certificate(app, config, mo
     monkeypatch.setattr(app, 'run', lambda *a, **k: result())
     monkeypatch.setattr(app, 'validate_certificate', lambda *_: b'OLD-DER')
     monkeypatch.setattr(app, 'verify_served', lambda *a, **k: chain.write_bytes(b'NEW'))
-    app.status(config, diagnose=True, interactive=True)
+    app.diagnose(config, interactive=True)
     assert app._menu_tls_check['success'] is False
+
+
+def test_full_diagnostics_keep_site_provenance_in_json_only(app, config, monkeypatch, capsys):
+    commit = '24134e23a438217cd52373ecdb0fcf7983e0e72c'
+    app.atomic_json(app.STATE / 'site-template.json', dict(id='2', name='Convertit', commit=commit))
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: SimpleNamespace(
+        collect=lambda _: {'checks': []}, display=lambda *a, **k: None))
+    monkeypatch.setattr(app, 'run', lambda *a, **k: result())
+    monkeypatch.setattr(app, 'verify_served', lambda *a, **k: None)
+    monkeypatch.setattr(app, 'validate_certificate', lambda *a: b'CERT')
+    report = app.diagnose(config, full=True)
+    text = capsys.readouterr().out
+    assert 'Сайт: Convertit' in text and commit not in text
+    assert report['installation']['site']['commit'] == commit
 
 
 def test_local_tls_rejects_certificate_change_during_check(app, config, monkeypatch):
@@ -1419,7 +1433,7 @@ def test_status_only_reads_snapshot_and_preserves_tls_cache(app, config, monkeyp
                  ('Порты', 'VPN 443 · HTTP 8080 · HTTPS 9443'), ('SSL', '89 дней'),
                  ('HTTPS', 'Не проверен'), ('Продление', 'Включено'), ('Заглушка', 'Convertit')],
         'installation': 'configured', 'hint': ''})
-    report = app.status(config, json_output=json_output, interactive=True, no_color=True)
+    report = app.status(config, json_output=json_output, no_color=True)
     output = capsys.readouterr().out
     assert calls == [config] and app._menu_tls_check == before
     assert list(report['summary']) == ['Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка']
@@ -1436,14 +1450,6 @@ def test_status_warns_about_pending_operation_without_running_recovery(app, monk
     report = app.status(None)
     assert report['pending'] == ['certificate-transaction.json']
     assert 'Есть незавершённая операция' in capsys.readouterr().out
-
-
-def test_menu_status_reuses_visible_snapshot(app, config, monkeypatch):
-    import client_panel
-    monkeypatch.setattr(client_panel, 'snapshot', lambda _: pytest.fail('visible status snapshot must be reused'))
-    panel = dict(rows=[('Домен', config['domain'])], installation='configured', hint='')
-    report = app.status(config, interactive=True, panel=panel)
-    assert report['summary'] == {'Домен': config['domain']}
 
 
 def test_ipv6_unavailable_is_not_reported_as_busy_http(app, monkeypatch):

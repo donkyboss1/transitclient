@@ -1418,9 +1418,9 @@ def certificate_status(config):
         return {'state': 'invalid', 'error': 'CERT_UNREADABLE'}
 
 
-def status(config, diagnose=False, json_output=False, interactive=False):
-    diagnostics = diagnostic_module()
-    report = diagnostics.collect(config)
+def saved_status(config):
+    """Read installation metadata without inventory, network checks or recovery."""
+    report = {'checks': []}
     report['installation'] = {'configured': config is not None,
                               'config_present': CONFIG.exists(),
                               'version': (PACKAGE / 'VERSION').read_text().strip(),
@@ -1452,6 +1452,38 @@ def status(config, diagnose=False, json_output=False, interactive=False):
                                     isinstance(last[key], (str, int, bool, type(None)))} if isinstance(last, dict) else None
     except (OSError, ValueError):
         report['last_operation'] = {'success': False, 'error': 'RESULT_UNREADABLE'}
+    return report
+
+
+def status(config, diagnose=False, json_output=False, interactive=False, full=False, no_color=False, panel=None):
+    report = saved_status(config)
+    if not diagnose:
+        import client_panel
+        import terminal_ui
+        if panel is None:
+            app = SimpleNamespace(**globals())
+            app.safe_config = lambda: config
+            panel = client_panel.snapshot(app)
+        report['summary'] = dict(panel['rows'])
+        report['installation']['state'] = panel['installation']
+        if json_output:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            terminal = terminal_ui.Terminal(no_color=no_color)
+            if interactive:
+                terminal.line('Состояние показано в верхней сводке.')
+            else:
+                terminal.line('📊 Transit Client · ' + report['installation']['version'], 'bold')
+                terminal_ui.draw_rows(terminal, panel['rows'])
+            if report['pending']:
+                terminal.line('⚠️ Есть незавершённая операция → Диагностика.', 'warning')
+            elif panel['installation'] in ('broken', 'incomplete'):
+                terminal.line('⚠️ ' + panel['hint'], 'warning')
+        return report
+    diagnostics = diagnostic_module()
+    inventory = diagnostics.collect(config)
+    report['checks'] = inventory['checks'] + report['checks']
+    report.update({key: value for key, value in inventory.items() if key != 'checks'})
     report['units'] = {}
     for unit in ('tenant-selfsteal-renew.timer', 'tenant-selfsteal-renew.service'):
         try:
@@ -1465,7 +1497,7 @@ def status(config, diagnose=False, json_output=False, interactive=False):
     if config and (timer.get('ActiveState') != 'active' or timer.get('UnitFileState') != 'enabled'
                    or timer.get('NextElapseUSecRealtime', '') in ('', '0', 'n/a')):
         report['checks'].append({'code': 'RENEW_TIMER_INACTIVE', 'status': 'error',
-                                 'message': 'Автоматическое продление не подтверждено: проверьте enabled/active и следующий запуск таймера.'})
+                                 'message': 'Автоматическое продление не подтверждено: таймер выключен либо следующий запуск неизвестен.'})
     verified_identity = None
     if config and (STATE / 'certificate-transaction.json').exists():
         report['checks'].append({'code': 'CERT_SWITCH_PENDING', 'status': 'unknown',
@@ -1491,19 +1523,11 @@ def status(config, diagnose=False, json_output=False, interactive=False):
             _menu_tls_check.update(at=int(time.time()), identity=verified_identity,
                                    success=identity is not None and identity == verified_identity
                                    and any(item['code'] == 'CERT_SERVED' for item in report['checks']))
-        certificate = report['installation']['certificate']
-        print('📊 Transit Client · ' + report['installation']['version'])
-        print('Домен: ' + (config['domain'] if config else 'не настроен'))
-        print('Сертификат: ' + {'missing': 'отсутствует', 'invalid': 'повреждён',
-                               'expired': 'просрочен', 'present': 'действителен на диске'}.get(certificate['state'], 'неизвестно'))
-        if 'days_remaining' in certificate:
-            print('Осталось дней: ' + str(certificate['days_remaining']))
-        print('Сайт: ' + client_panel.sanitize(report['installation']['site'].get('name', 'неизвестно')))
-        print('Незавершённые операции: ' + ('есть → Диагностика' if report['pending'] else 'нет'))
-        diagnostics.display(report)
-        return report
     if json_output:
         print(json.dumps(report, ensure_ascii=False, indent=2))
+        return report
+    if not full:
+        diagnostics.display(report, no_color=no_color)
         return report
     print('📊 transitclient · ' + report['installation']['version'])
     if config:
@@ -1519,7 +1543,7 @@ def status(config, diagnose=False, json_output=False, interactive=False):
     print('Незавершённые ресурсы: ' + (', '.join(report['pending']) or 'нет'))
     for unit, values in report['units'].items():
         print(unit + ': ' + json.dumps(values, ensure_ascii=False))
-    diagnostics.display(report)
+    diagnostics.display(report, full=True)
     return report
 
 
@@ -1762,9 +1786,12 @@ def dispatch(args):
         return 0
     if command in ('status', 'diagnose', 'self-test') and not args.http01 and not args.vpn:
         if interactive:
-            report = status(safe_config(), command != 'status', False, interactive=True)
+            report = status(safe_config(), command != 'status', False, interactive=True,
+                            full=getattr(args, 'full', False), no_color=getattr(args, 'no_color', False),
+                            panel=getattr(args, '_status_panel', None))
         else:
-            report = status(safe_config(), command != 'status', args.json)
+            report = status(safe_config(), command != 'status', args.json,
+                            full=getattr(args, 'full', False), no_color=getattr(args, 'no_color', False))
         return 1 if command == 'self-test' and any(item['status'] == 'error' for item in report['checks']) else 0
     if command == 'guide':
         guide(safe_config(), interactive=True) if interactive else guide(safe_config())
@@ -1890,6 +1917,7 @@ def main():
     parser.add_argument('--firewall', choices=['ufw', 'manual'], help='Управление UFW (по умолчанию) или собственный firewall')
     parser.add_argument('--probe-token', help=argparse.SUPPRESS)
     parser.add_argument('--json', action='store_true', help='JSON отчёт status/diagnose/self-test')
+    parser.add_argument('--full', action='store_true', help='Подробный отчёт diagnose')
     parser.add_argument('--no-color', action='store_true', help='Без ANSI цветов в интерактивном меню')
     parser.add_argument('--http01', action='store_true', help='Явный временный HTTP self-test, без ACME')
     parser.add_argument('--vpn', action='store_true', help='Явная TLS-проверка в указанном VPN-контейнере')
@@ -1899,6 +1927,8 @@ def main():
         return
     if (args.http01 or args.vpn) and args.command != 'self-test':
         parser.error('--http01/--vpn применимы только к self-test')
+    if args.full and args.command != 'diagnose':
+        parser.error('--full применим только к diagnose')
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         result = menu(args) if args.command == 'menu' else perform(args)

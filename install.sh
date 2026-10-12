@@ -6,9 +6,9 @@ set -euo pipefail
 umask 077
 
 # Publication fills these three values together. Never guess a repository URL.
-RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.4.4.tar.gz'
-RELEASE_VERSION='1.4.4'
-RELEASE_SHA256='d3d75bbb8a5123e7586568e8f3a7cfc805b92f198326703503c8345fa22fbc23'
+RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.4.5.tar.gz'
+RELEASE_VERSION='1.4.5'
+RELEASE_SHA256='936fafb88bf193b29fbf848d8606173c33fdcc629e2152cd0ed1969ecf373e7f'
 
 fail() { printf '\n❌ %s\n' "$*" >&2; exit 1; }
 usage() {

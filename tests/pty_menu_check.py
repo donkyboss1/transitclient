@@ -219,6 +219,13 @@ def child(scenario, no_color):
 
         def fake_perform(args):
             command = args.command
+            if scenario == 'real-status' and command == 'status':
+                app.diagnostic_module = app.verify_served = forbidden
+                before = dict(app._menu_tls_check)
+                app.status(config, interactive=True, no_color=no_color)
+                assert app._menu_tls_check == before
+                print('STATUS_NO_DIAGNOSTIC', flush=True)
+                return 0
             if scenario in ('vs16-output', 'vs16-buffered'):
                 for chunk in ('☁', '\ufe0f'):
                     sys.stdout.write(chunk)
@@ -274,6 +281,7 @@ def child(scenario, no_color):
                 print('CONFIG_CHOICE=' + str(getattr(args, '_configure_choice', '?')), flush=True)
                 input('Новое значение: ')
             if command == 'diagnose':
+                print('DIAGNOSTIC_FULL=' + str(getattr(args, 'full', False)), flush=True)
                 print('TEST_ERROR: безопасная тестовая ошибка', flush=True)
                 return 1
             if command == 'self-test':
@@ -449,6 +457,46 @@ def sequential_main_actions():
             session.expect(PROMPT)
         session.send('0\n')
         session.finish()
+
+
+def diagnostic_details():
+    for columns, lines in ((80, 40), (48, 20)):
+        with Session(columns=columns, lines=lines) as session:
+            session.send('4\n')
+            session.expect('DIAGNOSTIC_FULL=False')
+            session.expect('Нажмите Enter для возврата')
+            session.send('bad\n')
+            session.expect('Неизвестный пункт')
+            session.expect('Нажмите Enter для возврата')
+            session.send('1\n')
+            session.expect('DIAGNOSTIC_FULL=True')
+            session.expect('Нажмите Enter для возврата')
+            assert_shared_header(current_screen(session), columns)
+            session.send('\n')
+            session.expect(PROMPT)
+            assert '\x1b[r' in session.output
+            session.send('0\n')
+            session.finish()
+
+
+def real_status_output():
+    for columns, lines in ((80, 40), (48, 20)):
+        with Session('real-status', columns=columns, lines=lines) as session:
+            session.send('3\n')
+            session.expect('STATUS_NO_DIAGNOSTIC')
+            session.expect(PAUSE)
+            raw = current_screen(session)
+            assert_shared_header(raw, columns)
+            plain = CSI.sub('', raw)
+            for label in ('Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка'):
+                assert plain.count(label + ':') == 1, (columns, label, plain)
+            assert 'Состояние показано в верхней сводке.' in plain
+            assert 'Диагностика transitclient' not in plain
+            assert '\x1b[1;36mnode.example.com\x1b[0m' in raw
+            session.send('\n')
+            session.expect(PROMPT)
+            session.send('0\n')
+            session.finish()
 
 
 def operation_modes():
@@ -789,7 +837,7 @@ def main():
         return
     if os.name != 'posix':
         parser.error('Run in Linux/WSL: python3 tests/pty_menu_check.py')
-    checks = [back_and_cancel, invalid_and_results, sequential_main_actions, operation_modes,
+    checks = [back_and_cancel, invalid_and_results, sequential_main_actions, diagnostic_details, real_status_output, operation_modes,
               input_cancel_and_operation_interrupt, eof_at_every_level,
               confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output,
               shared_headers_direct_docker_and_operation_regions, operation_stream_and_long_report,

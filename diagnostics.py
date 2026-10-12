@@ -272,7 +272,8 @@ selected_ports and dns. statuses are ok/warning/error/unknown.
     except (OSError, ValueError, UnicodeError):
         pass
     supported = report['os'].get('id') == 'ubuntu' and report['os'].get('version') in ('22.04', '24.04', '26.04')
-    _check(report, 'OS_SUPPORTED', 'ok' if supported else 'warning', 'Целевая ОС Ubuntu 22.04/24.04/26.04; реальная приёмка заявляется отдельно.')
+    _check(report, 'OS_SUPPORTED', 'ok' if supported else 'warning',
+           'ОС поддерживается.' if supported else 'Эта ОС не поддерживается: требуется Ubuntu 22.04/24.04/26.04.')
     for name in ('bash', 'curl', 'wget', 'python3', 'openssl', 'ss', 'systemctl', 'docker', 'ufw', 'socat', 'tar'):
         report['dependencies'][name] = bool(shutil.which(name))
     report['systemd'] = dict(available=report['dependencies']['systemctl'], running=Path('/run/systemd/system').is_dir())
@@ -285,11 +286,13 @@ selected_ports and dns. statuses are ok/warning/error/unknown.
     except OSError:
         _check(report, 'DISK_SPACE', 'unknown', 'Свободное место не удалось проверить.')
     ufw = _run(['ufw', 'status']) if report['dependencies']['ufw'] else None
-    report['firewall'] = {'ufw': 'active' if ufw and 'Status: active' in ufw else
+    report['firewall'] = {'ufw': 'missing' if not report['dependencies']['ufw'] else
+                           'active' if ufw and 'Status: active' in ufw else
                            'inactive' if ufw and 'Status: inactive' in ufw else 'unknown'}
+    firewall_messages = {'active': 'UFW включён.', 'inactive': 'UFW выключен.',
+                         'missing': 'UFW не установлен.', 'unknown': 'Не удалось проверить состояние UFW.'}
     _check(report, 'LOCAL_FIREWALL', 'ok' if report['firewall']['ufw'] == 'active' else 'unknown',
-           'UFW активен; чужие правила сохраняются.' if report['firewall']['ufw'] == 'active' else
-           'UFW не активен либо недоступен. Установка подготовит его после проверки SSH и служб; внешний firewall/NAT проверяется отдельно.')
+           firewall_messages[report['firewall']['ufw']])
     clock = _run(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value']) if shutil.which('timedatectl') else None
     _check(report, 'SYSTEM_CLOCK', 'ok' if clock and clock.strip() == 'yes' else 'unknown',
            'Системное время синхронизировано.' if clock and clock.strip() == 'yes' else
@@ -338,7 +341,10 @@ selected_ports and dns. statuses are ok/warning/error/unknown.
     if len({row['port'] for row in report['selected_ports'].values()}) != len(report['selected_ports']):
         _check(report, 'PORTS_OVERLAP', 'error', 'VPN, проверочный HTTP и локальный HTTPS должны иметь разные номера портов.')
     _check(report, 'RELAY_REACHABILITY_UNPROVEN', 'unknown', 'Внешнюю доступность backend/NAT и HTTP-01 с релея локальная диагностика не доказывает. Внешний HTTP-01 приходит на TCP 80 релея.')
-    _check(report, 'VPN_CONTAINER_TARGET', 'warning', '127.0.0.1:9443 доступен VPN на хосте или в host network. Для bridge-контейнера нужен отдельный согласованный закрытый сетевой target; чужие сети не меняются.')
+    vpn_listeners = report['selected_ports'].get('vpn', {}).get('listeners', [])
+    if not vpn_listeners or any(row.get('network_mode') != 'host' for row in vpn_listeners):
+        _check(report, 'VPN_CONTAINER_TARGET', 'unknown',
+               'Доступ ноды к HTTPS target не подтверждён. Для контейнера в bridge-сети запустите самопроверку из ноды.')
     domain = config.get('domain')
     if domain and isinstance(domain, str) and re.fullmatch(r'[A-Za-z0-9.\-]{1,253}', domain):
         report['dns']['domain'] = domain
@@ -383,8 +389,116 @@ def display_compact(report, ports=False):
             print('❌ [' + item['code'] + '] ' + item['message'])
 
 
-def display(report):
+def display_summary(report, no_color=False):
+    """Client-facing findings; successful infrastructure checks stay in full output."""
+    import client_panel
+    import terminal_ui
+    terminal = terminal_ui.Terminal(no_color=no_color)
+    icons = dict(ok='✅', warning='⚠️', error='❌', unknown='❔')
+    def line(label, value, state=None):
+        value = (icons[state] + ' ' if state else '') + client_panel.sanitize(value, 500)
+        # Do not clip errors to screen width; operation output handles wrapping.
+        label = client_panel.sanitize(label, 180)
+        prefix = '\x1b[1m' + label + ':\x1b[0m' if terminal.colors else label + ':'
+        print(prefix + ' ' + value)
+    checks = {item['code']: item for item in report['checks']}
+    terminal.line('🔍 Диагностика · Transit Client', 'bold')
+    installation = report.get('installation', {})
+    if installation and not installation.get('configured'):
+        line('Установка', 'конфигурация повреждена' if installation.get('config_present') else 'ещё не настроена', 'warning')
+    system = report['os']
+    line('ОС', f"{system.get('id', system.get('system', 'неизвестно'))} {system.get('version', '')} · {system.get('architecture', 'неизвестно')}")
+    docker = report['docker']
+    caddies = [row for row in docker['containers'] if row['owned'] and
+               re.search(r'(^|[/_.:\-])caddy($|[/_.:\-])', row['image'].lower())]
+    if caddies:
+        for row in caddies:
+            line('Caddy', ('работает' if row['running'] else 'остановлен') + ' · сеть ' + row['network_mode'],
+                 'ok' if row['running'] else 'warning')
+    else:
+        line('Caddy', 'не найден' if docker.get('inventory_complete') else 'состояние неизвестно', 'unknown')
+    ufw = report.get('firewall', {}).get('ufw', 'unknown')
+    line('UFW', {'active': 'включён', 'inactive': 'выключен', 'missing': 'не установлен',
+                 'unknown': 'не удалось проверить состояние'}.get(ufw, 'не удалось проверить состояние'),
+         'ok' if ufw == 'active' else 'warning' if ufw in ('missing', 'inactive') else 'unknown')
+    missing = [name for name, present in report['dependencies'].items() if not present and
+               name not in ('ufw', 'docker') and (name not in ('curl', 'wget') or
+                                               not any(report['dependencies'].get(tool) for tool in ('curl', 'wget')))]
+    if missing:
+        line('Отсутствуют программы', ', '.join(missing), 'warning')
+    labels = {'vpn': 'VPN', 'challenge': 'HTTP', 'local': 'HTTPS'}
+    for role, selected in report['selected_ports'].items():
+        rows = selected['listeners']
+        address = selected.get('address')
+        label = labels[role] + ' ' + (address + ':' if address else '') + str(selected['port'])
+        role_codes = ('VPN_LISTENER_MISSING', 'VPN_LOOPBACK_ONLY') if role == 'vpn' else (
+            ('HTTP_PORT_BUSY', 'HTTP_PORT_AVAILABLE', 'HTTP_OWN_LISTENER') if role == 'challenge' else
+            ('HTTPS_PORT_BUSY', 'HTTPS_PORT_AVAILABLE', 'HTTPS_OWN_LISTENER', 'HTTPS_DOCKER_TARGET'))
+        finding = next((checks[code] for code in role_codes if code in checks), None)
+        if rows:
+            owners = sorted({row.get('container') or ', '.join(proc['name'] for proc in row.get('processes', []))
+                             or 'владелец неизвестен' for row in rows})
+            modes = sorted({row['network_mode'] for row in rows if row.get('network_mode')})
+            state = finding['status'] if finding else 'unknown'
+            if role == 'vpn' and not finding:
+                state = 'ok'
+            detail = ('обслуживает наш Caddy' if role == 'local' and all(row.get('owned') for row in rows) else
+                      'слушает ' + ', '.join(owners))
+            if state == 'error':
+                detail = 'конфликт · ' + ', '.join(owners)
+            if modes:
+                detail += ' · сеть ' + ', '.join(modes)
+        elif finding and finding['code'] == 'HTTPS_DOCKER_TARGET':
+            state, detail = 'unknown', 'target в Docker-сети · нужна самопроверка из ноды'
+            label = 'HTTPS target'
+        else:
+            state = finding['status'] if finding else 'unknown'
+            detail = ('слушатель не найден' if role == 'vpn' and state != 'unknown' else
+                      'свободен' if role != 'vpn' and state == 'ok' else 'не удалось проверить')
+        line(label, detail, state)
+    dns = report.get('dns', {})
+    if dns.get('domain'):
+        finding = next((checks[code] for code in ('DNS_LOOKUP_FAILED', 'DNS_RELAY_MISMATCH', 'DNS_RESOLVED') if code in checks), None)
+        detail = ', '.join(dns.get('addresses') or []) or 'не удалось разрешить домен'
+        if finding and finding['status'] == 'error':
+            detail += ' · ' + finding['message']
+        elif finding and finding['status'] == 'unknown':
+            detail += ' · ожидаемый IP релея не задан'
+        line('DNS', detail, finding['status'] if finding else 'unknown')
+    certificate = report.get('installation', {}).get('certificate', {})
+    if certificate:
+        soon = certificate.get('state') == 'present' and certificate.get('days_remaining', 90) <= 14
+        detail = {'present': 'действителен на диске', 'missing': 'отсутствует', 'expired': 'срок истёк',
+                  'invalid': 'не удалось прочитать'}.get(certificate.get('state'), 'неизвестно')
+        if soon:
+            detail = 'скоро истекает (на диске)'
+        if 'days_remaining' in certificate:
+            detail += f" · осталось {certificate['days_remaining']} дней"
+        line('SSL', detail, 'ok' if certificate.get('state') == 'present' and not soon else 'warning')
+    if 'CERT_SERVED' in checks:
+        line('Проверка HTTPS', 'нужный сертификат и защищённое подключение подтверждены', 'ok')
+    elif 'CERT_NOT_APPLIED' in checks:
+        line('Проверка HTTPS', checks['CERT_NOT_APPLIED']['message'], 'error')
+    handled = {'LOCAL_FIREWALL', 'VPN_LISTENER_PRESENT', 'VPN_LISTENER_MISSING', 'HTTP_PORT_AVAILABLE',
+               'HTTPS_PORT_AVAILABLE', 'HTTP_OWN_LISTENER', 'HTTPS_OWN_LISTENER', 'HTTPS_DOCKER_TARGET',
+               'HTTP_PORT_BUSY', 'HTTPS_PORT_BUSY', 'DNS_RESOLVED', 'DNS_LOOKUP_FAILED', 'DNS_RELAY_MISMATCH',
+               'CERT_SERVED', 'CERT_NOT_APPLIED', 'RELAY_REACHABILITY_UNPROVEN', 'EXISTING_WEB_SERVER',
+               'OTHER_WEB_PORT_LISTENER'}
+    findings = [item for item in report['checks'] if item['status'] != 'ok' and item['code'] not in handled]
+    if report.get('pending'):
+        line('Операции', 'есть незавершённая операция; подробности в полном отчёте', 'warning')
+    if findings:
+        terminal.line('Требует внимания', 'bold')
+        for item in findings:
+            print(icons[item['status']] + ' ' + client_panel.sanitize(item['message'], 500))
+    print('Доступ с релея проверяется отдельно в боте; внешний firewall/NAT — в панели провайдера.')
+
+
+def display(report, full=False, no_color=False):
     """Print only the allowlisted report, never subprocess stdout/stderr."""
+    if not full:
+        display_summary(report, no_color=no_color)
+        return
     print('🔍 Диагностика transitclient · без изменения инфраструктуры')
     system = report['os']
     print(f"ОС: {system.get('id', system['system'])} {system.get('version', '')} · {system['architecture']}")

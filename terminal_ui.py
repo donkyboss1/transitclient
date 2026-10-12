@@ -343,6 +343,13 @@ def columns(terminal, options):
         terminal.fragments(left)
 
 
+def draw_rows(terminal, rows):
+    compact = terminal.width < 70 or terminal.height < 36
+    for label, value in rows:
+        padding = ' ' if compact else ' ' * max(1, 14 - display_width(label + ':'))
+        terminal.fragments([(label + ':', 'bold'), (padding, None), (value, 'domain' if label == 'Домен' else None)])
+
+
 def draw_header(terminal, app):
     terminal.width, terminal.height = shutil.get_terminal_size((80, 40))
     panel = client_panel.snapshot(app)
@@ -355,9 +362,7 @@ def draw_header(terminal, app):
     rows = panel['rows']
     if terminal.height < 18:
         rows = [row for row in rows if row[0] in ('Сервер', 'Домен', 'SSL', 'HTTPS')]
-    for label, value in rows:
-        padding = ' ' if compact else ' ' * max(1, 14 - display_width(label + ':'))
-        terminal.fragments([(label + ':', 'bold'), (padding, None), (value, 'domain' if label == 'Домен' else None)])
+    draw_rows(terminal, rows)
     terminal.line('─' * min(60, terminal.width), 'label')
     return panel, 2 + len(rows) + int(not compact)
 
@@ -447,6 +452,7 @@ def run(app, args):
             selected = argparse.Namespace(**vars(args))
             selected._menu_mode = True
             selected.json, selected.http01, selected.vpn = False, False, False
+            selected.full = False
             if screen == 'main' and choice in OPERATIONS:
                 selected.command = OPERATIONS[choice]
             elif screen == 'settings' and choice in ('1', '2', '3', '4'):
@@ -461,11 +467,25 @@ def run(app, args):
                 notice = 'Неизвестный пункт. Выберите действие из списка.'
                 continue
             try:
-                _, header_lines = draw_header(terminal, app)
+                panel, header_lines = draw_header(terminal, app)
+                if selected.command == 'status':
+                    selected._status_panel = panel
                 with operation_output(terminal, header_lines):
                     draw_title = TITLES.get(screen) or MENU[choice][0]
                     terminal.line(draw_title, 'bold')
                     app.perform(selected)
+                    if selected.command == 'diagnose':
+                        while True:
+                            terminal.fragments(option('1', 'Подробный отчёт') + [(' · Enter — назад', None)])
+                            detail = input('Нажмите Enter для возврата или 1 для подробного отчёта: ').strip()
+                            if not detail:
+                                break
+                            if detail != '1':
+                                terminal.line('Неизвестный пункт. Нажмите Enter или 1.', 'warning')
+                                continue
+                            selected.full = True
+                            app.perform(selected)
+                        continue
                     input('Нажмите Enter для возврата…')
             except KeyboardInterrupt:
                 if len(stack) > 1:

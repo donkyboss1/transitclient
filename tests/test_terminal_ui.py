@@ -52,6 +52,25 @@ def inputs(monkeypatch, values):
     monkeypatch.setattr('builtins.input', read)
 
 
+def test_diagnostic_full_report_and_invalid_selection(app, ui, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(app, 'perform', lambda selected: calls.append((selected.command, selected.full)) or 0)
+    inputs(monkeypatch, ['4', 'bad', '1', '', '3', '', '0'])
+    ui.run(app, args())
+    assert calls == [('diagnose', False), ('diagnose', True), ('status', False)]
+    output = capsys.readouterr().out
+    assert 'Подробный отчёт' in output and 'Неизвестный пункт' in output
+
+
+@pytest.mark.parametrize('signal', [KeyboardInterrupt(), EOFError()])
+def test_diagnostic_detail_prompt_handles_cancel_and_eof(app, ui, monkeypatch, signal):
+    calls = []
+    monkeypatch.setattr(app, 'perform', lambda selected: calls.append(selected.full) or 0)
+    inputs(monkeypatch, ['4', signal, '0'])
+    assert ui.run(app, args()) == 0
+    assert calls == [False]
+
+
 @pytest.mark.parametrize('submenu', ['2', '5', '6'])
 def test_view_and_back_never_perform(app, ui, monkeypatch, submenu):
     monkeypatch.setattr(app, 'perform', lambda _: pytest.fail('Browsing cannot perform'))

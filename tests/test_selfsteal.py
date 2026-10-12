@@ -1378,18 +1378,18 @@ def test_setting_confirmation_shows_old_and_new_before_decline(app, config, monk
     assert app.CONFIG.read_bytes() == before
 
 
-def test_status_does_not_cache_replaced_unverified_certificate(app, config, monkeypatch):
+def test_diagnose_does_not_cache_replaced_unverified_certificate(app, config, monkeypatch):
     current = app.STATE / 'certs/current'
     current.mkdir(parents=True)
     chain = current / 'fullchain.pem'
     chain.write_bytes(b'OLD')
     monkeypatch.setattr(app, 'certificate_status', lambda _: {'state': 'present'})
     monkeypatch.setattr(app, 'diagnostic_module', lambda: SimpleNamespace(
-        collect=lambda _: {'checks': []}, display=lambda _: None))
+        collect=lambda _: {'checks': []}, display=lambda *a, **k: None))
     monkeypatch.setattr(app, 'run', lambda *a, **k: result())
     monkeypatch.setattr(app, 'validate_certificate', lambda *_: b'OLD-DER')
     monkeypatch.setattr(app, 'verify_served', lambda *a, **k: chain.write_bytes(b'NEW'))
-    app.status(config, interactive=True)
+    app.status(config, diagnose=True, interactive=True)
     assert app._menu_tls_check['success'] is False
 
 
@@ -1403,6 +1403,47 @@ def test_local_tls_rejects_certificate_change_during_check(app, config, monkeypa
     with pytest.raises(app.Failure):
         app.local_self_test(config)
     assert app._menu_tls_check['success'] is False
+
+
+@pytest.mark.parametrize('json_output', [False, True])
+def test_status_only_reads_snapshot_and_preserves_tls_cache(app, config, monkeypatch, capsys, json_output):
+    import client_panel
+    app._menu_tls_check.update(at=123, success=True, identity={'domain': config['domain']})
+    before = dict(app._menu_tls_check)
+    calls = []
+    monkeypatch.setattr(app, 'diagnostic_module', lambda: pytest.fail('status must not inventory host or resolve DNS'))
+    monkeypatch.setattr(app, 'verify_served', lambda *a, **k: pytest.fail('status must not probe TLS'))
+    monkeypatch.setattr(app, 'run', lambda *a, **k: pytest.fail('status must use the bounded snapshot'))
+    monkeypatch.setattr(client_panel, 'snapshot', lambda proxy: calls.append(proxy.safe_config()) or {
+        'rows': [('Сервер', 'Caddy · Работает'), ('Домен', config['domain']),
+                 ('Порты', 'VPN 443 · HTTP 8080 · HTTPS 9443'), ('SSL', '89 дней'),
+                 ('HTTPS', 'Не проверен'), ('Продление', 'Включено'), ('Заглушка', 'Convertit')],
+        'installation': 'configured', 'hint': ''})
+    report = app.status(config, json_output=json_output, interactive=True, no_color=True)
+    output = capsys.readouterr().out
+    assert calls == [config] and app._menu_tls_check == before
+    assert list(report['summary']) == ['Сервер', 'Домен', 'Порты', 'SSL', 'HTTPS', 'Продление', 'Заглушка']
+    assert 'listeners' not in report and 'Диагностика' not in output and '\x1b' not in output
+    assert 'Незавершённые' not in output
+
+
+def test_status_warns_about_pending_operation_without_running_recovery(app, monkeypatch, capsys):
+    import client_panel
+    app.atomic_json(app.STATE / 'certificate-transaction.json', {'state': 'pending'})
+    monkeypatch.setattr(client_panel, 'snapshot', lambda _: {
+        'rows': [], 'installation': 'incomplete', 'hint': 'Установка не завершена.'})
+    monkeypatch.setattr(app, 'recover_certificate', lambda: pytest.fail('status must not recover'))
+    report = app.status(None)
+    assert report['pending'] == ['certificate-transaction.json']
+    assert 'Есть незавершённая операция' in capsys.readouterr().out
+
+
+def test_menu_status_reuses_visible_snapshot(app, config, monkeypatch):
+    import client_panel
+    monkeypatch.setattr(client_panel, 'snapshot', lambda _: pytest.fail('visible status snapshot must be reused'))
+    panel = dict(rows=[('Домен', config['domain'])], installation='configured', hint='')
+    report = app.status(config, interactive=True, panel=panel)
+    assert report['summary'] == {'Домен': config['domain']}
 
 
 def test_ipv6_unavailable_is_not_reported_as_busy_http(app, monkeypatch):

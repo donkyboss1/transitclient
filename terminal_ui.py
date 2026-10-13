@@ -147,7 +147,8 @@ class CellStream:
                 size = 8 - (state.column - 1) % 8 if char == '\t' else cluster_width(char)
                 # VS16 may arrive in the next write. Keep a possible emoji base
                 # off the final cell before its presentation selector arrives.
-                possible_emoji = ('\u2190' <= char <= '\u27bf'
+                possible_emoji = ('\u2194' <= char <= '\u2199' or char in ('\u21a9', '\u21aa')
+                                  or '\u2300' <= char <= '\u23ff' or '\u2600' <= char <= '\u27bf'
                                   or '\u2b00' <= char <= '\u2bff'
                                   or '\U0001f000' <= char <= '\U0001faff')
                 reserve = max(size, 2) if possible_emoji else size
@@ -378,6 +379,7 @@ def draw(terminal, app, screen, notice=''):
                                        ('3', 'local_port', 'Локальный HTTPS-порт веб-сервера')]:
                 terminal.fragments(option(number, f"{label}: {(config or {}).get(key) or 'неизвестно'}"))
             terminal.fragments(option('4', 'Docker-сеть: ' + ((config or {}).get('docker_network') or 'host / loopback')))
+            terminal.fragments(option('5', 'Firewall: ' + ((config or {}).get('firewall_effective') or (config or {}).get('firewall') or 'auto')))
         elif screen == 'tests':
             terminal.fragments(option('1', 'Локальная HTTPS — без изменений'))
             terminal.fragments(option('2', 'HTTP через релей — временный тест'))
@@ -441,7 +443,7 @@ def run(app, args):
             selected.full = False
             if screen == 'main' and choice in OPERATIONS:
                 selected.command = OPERATIONS[choice]
-            elif screen == 'settings' and choice in ('1', '2', '3', '4'):
+            elif screen == 'settings' and choice in ('1', '2', '3', '4', '5'):
                 selected.command, selected._configure_choice = 'configure', choice
             elif screen == 'tests' and choice in ('1', '2', '3'):
                 selected.command = 'self-test'

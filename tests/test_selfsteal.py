@@ -71,7 +71,7 @@ def test_first_setup_only_asks_domain_and_three_ports(app, monkeypatch):
     assert len(prompts) == 4
     assert not any(word in ' '.join(prompts) for word in ('IP', 'Docker', 'Firewall', 'контейнер'))
     assert saved['vpn_port'] == 443 and saved['challenge_port'] == 8080 and saved['local_port'] == 9443
-    assert saved['firewall'] == 'ufw' and saved['relay_ip'] == ''
+    assert saved['firewall'] == 'auto' and saved['relay_ip'] == ''
 
 
 @pytest.mark.parametrize('answer,approved', [('', False), ('n', False), ('N', False),
@@ -278,7 +278,8 @@ def test_ca_failure_preserves_old_files_and_stops_own_listener(app, config, monk
     def fake_run(args, **kwargs):
         calls.append(args)
         if args[:2] == ['systemctl', 'show'] and any(command[0] == 'systemd-run' for command in calls):
-            return result(output=('LoadState=loaded\nDescription=Transitclient ACME\nExecStart=' +
+            identifier = app._operation_id
+            return result(output=('LoadState=loaded\nDescription=Transitclient acme ' + config['install_id'] + ' ' + identifier + '\nExecStart=' +
                                  str(app.INSTALL / 'vendor/acme.sh') + ' --home ' + str(app.STATE / 'acme') + '\n').encode())
         return result(code=1 if args[0] == 'systemd-run' else 0)
 
@@ -286,7 +287,7 @@ def test_ca_failure_preserves_old_files_and_stops_own_listener(app, config, monk
     with pytest.raises(app.Failure, match='ACME-проверка'):
         app.renew(config)
     assert (old / 'fullchain.pem').read_text() == 'OLD CERT'
-    assert ['systemctl', 'stop', 'tenant-selfsteal-acme.service'] in calls
+    assert any(call[:2] == ['systemctl', 'stop'] and call[2].startswith('tenant-selfsteal-acme-') for call in calls)
     assert not (app.STATE / 'result.json').exists()
 
 
@@ -383,7 +384,7 @@ def test_recovery_stable_helper_restores_update_rename_gap(app, monkeypatch):
     assert not (app.STATE / 'update-transaction.json').exists()
 
 
-def test_timer_must_have_real_scheduled_next_run(app, monkeypatch):
+def test_unit_preparation_never_activates_timer_under_parent_lock(app, monkeypatch):
     app.UNITS.mkdir()
     calls = []
 
@@ -392,9 +393,9 @@ def test_timer_must_have_real_scheduled_next_run(app, monkeypatch):
         return result(output=b'')
 
     monkeypatch.setattr(app, 'run', fake_run)
-    with pytest.raises(app.Failure, match='не назначен'):
-        app.install_units()
-    assert ['systemctl', 'is-active', '--quiet', 'tenant-selfsteal-renew.timer'] in calls
+    app.install_units()
+    assert not any('--now' in call for call in calls)
+    assert (app.STATE / 'schedule-pending.json').exists()
     assert (app.STATE / 'recover.py').exists()
 
 
@@ -494,14 +495,19 @@ def test_update_menu_launch_instruction_only_after_success(app, config, monkeypa
     app.INSTALL.mkdir()
     (app.INSTALL / 'VERSION').write_text('1.4.2')
     (app.INSTALL / 'selfsteal.py').write_text('retained test controller')
+    app.atomic_json(app.CONFIG, config)
     monkeypatch.setattr(app, 'verified_download', lambda _, __, destination: shutil.copyfile(release, destination))
     monkeypatch.setattr(app, 'check_install_resources', lambda: None)
     monkeypatch.setattr(app, 'assert_compose_owned', lambda: None)
     monkeypatch.setattr(app, 'confirm', lambda _: outcome != 'decline')
     calls = []
     def apply(command, **_):
+        if command[:2] == ['systemctl', 'show']:
+            return result(output=b'UnitFileState=disabled\nActiveState=inactive\n')
+        if command == ['systemctl', 'daemon-reload']:
+            return result()
         calls.append(command)
-        assert command[-1] == '_update-apply', 'Only the offline update application may be requested'
+        assert '_update-apply' in command, 'Only the offline update application may be requested'
         if outcome == 'failure':
             raise app.Failure('Simulated apply failure')
         return result()
@@ -717,6 +723,7 @@ def test_caddy_exec_failure_is_detected_before_issuance_and_hides_output(app, mo
 
 def test_update_apply_of_partial_install_never_issues_cert_or_starts_caddy(app, config, monkeypatch):
     app.atomic_json(app.CONFIG, config)
+    app.atomic_json(app.STATE / 'update-transaction.json', {'id': 'a' * 32, 'parent_pid': os.getppid()})
     for name in ('require_host', 'check_install_resources', 'assert_compose_owned', 'dependencies',
                  'install_units', 'install_launcher', 'mark_package'):
         monkeypatch.setattr(app, name, lambda *_: None)
@@ -726,19 +733,20 @@ def test_update_apply_of_partial_install_never_issues_cert_or_starts_caddy(app, 
     monkeypatch.setattr(app, 'reload_caddy', lambda: pytest.fail('Partial install has no running Caddy'))
     calls = []
     monkeypatch.setattr(app, 'compose', lambda *args, **_: calls.append(args) or result())
-    assert app.dispatch(SimpleNamespace(command='_update-apply')) == 0
+    assert app.dispatch(SimpleNamespace(command='_update-apply', operation_id='a' * 32)) == 0
     assert calls == [('config', '--quiet')]
 
 
 def test_update_apply_missing_certificate_does_not_touch_existing_caddy(app, config, monkeypatch):
     app.atomic_json(app.CONFIG, config)
+    app.atomic_json(app.STATE / 'update-transaction.json', {'id': 'a' * 32, 'parent_pid': os.getppid()})
     monkeypatch.setattr(app, 'require_host', lambda: None)
     monkeypatch.setattr(app, 'check_install_resources', lambda: None)
     monkeypatch.setattr(app, 'assert_compose_owned', lambda: None)
     monkeypatch.setattr(app, 'run', lambda *_, **__: result(output=b'existing-owned-caddy'))
     monkeypatch.setattr(app, 'dependencies', lambda: pytest.fail('Conflicting state must fail before mutation'))
     with pytest.raises(app.Failure) as error:
-        app.dispatch(SimpleNamespace(command='_update-apply'))
+        app.dispatch(SimpleNamespace(command='_update-apply', operation_id='a' * 32))
     assert error.value.code == 'UPDATE_CERT_MISSING'
 
 
@@ -861,12 +869,12 @@ def test_failed_probe_launch_does_not_stop_competing_unit(app, config, monkeypat
     monkeypatch.setattr(app, 'confirm', lambda _: True)
     monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
     monkeypatch.setattr(app, 'open_firewall', lambda _: None)
-    monkeypatch.setattr(app, 'cleanup_firewall', lambda: calls.append('cleanup'))
+    monkeypatch.setattr(app, 'cleanup_firewall', lambda *args: calls.append('cleanup'))
     monkeypatch.setattr(app, 'stop_probe', lambda: pytest.fail('Failed launch does not prove unit ownership'))
     monkeypatch.setattr(app, 'run', lambda *a, **k: (_ for _ in ()).throw(app.Failure('Unit collision')))
     with pytest.raises(app.Failure):
         app.http_self_test(config)
-    assert calls == ['cleanup']
+    assert calls == ['cleanup', 'cleanup']
 
 
 def test_reconfigure_failure_restores_previous_runtime_and_config(app, config, monkeypatch):
@@ -944,8 +952,9 @@ def test_http_probe_nonce_success_stops_only_owned_unit_and_never_ca(app, config
     monkeypatch.setattr(app.urllib.request, 'build_opener', lambda *_: Opener())
     app.http_self_test(config)
     assert events == ['open', 'stop-owned']
-    assert len(calls) == 1 and '--unit=tenant-selfsteal-probe' in calls[0]
-    assert '--property=RuntimeMaxSec=120s' in calls[0]
+    launches = [call for call in calls if call[0] == 'systemd-run']
+    assert len(launches) == 1 and '--unit=tenant-selfsteal-probe-' + 'a' * 32 in launches[0]
+    assert '--property=RuntimeMaxSec=120s' in launches[0]
     assert not any('acme.sh' in str(value) for call in calls for value in call)
 
 
@@ -1004,6 +1013,7 @@ def retained_install(app, config, monkeypatch, tmp_path):
     for name in ('detect_vpn_network', 'check_dns', 'check_challenge_port', 'assert_local_docker', 'assert_compose_owned',
                  'validate_network', 'dependencies', 'install_launcher', 'render_caddy', 'install_units', 'change_template', 'renew'):
         monkeypatch.setattr(app, name, lambda *_, **__: None)
+    monkeypatch.setattr(app, 'http_self_test', lambda *_, **__: None)
     monkeypatch.setattr(app, 'free_port', lambda *_: True)
     monkeypatch.setattr(app, 'select_template', lambda *_: 'builtin')
     monkeypatch.setattr(app.shutil, 'which', lambda _: '/bin/docker')
@@ -1057,7 +1067,8 @@ def test_reinstall_rename_gap_keeps_stable_helper_and_journal_for_recovery(app, 
     with pytest.raises(SystemExit):
         app.install(SimpleNamespace(template=None))
     assert not app.INSTALL.exists()
-    assert (app.STATE / 'recover.py').read_text() == 'incoming selfsteal.py'
+    pointer = app.read_json(app.STATE / 'recovery-current.json')
+    assert (app.STATE / 'recovery' / pointer['generation'] / 'selfsteal.py').read_text() == 'incoming selfsteal.py'
     assert (app.STATE / 'update-transaction.json').exists()
 
 
@@ -1275,7 +1286,7 @@ def test_http_test_cleans_owned_probe_before_interrupt(app, config, monkeypatch,
     monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
     events = []
     monkeypatch.setattr(app, 'open_firewall', lambda _: events.append('open'))
-    monkeypatch.setattr(app, 'run', lambda *a, **k: events.append('launch') or result())
+    monkeypatch.setattr(app, 'run', lambda args, **k: (events.append('launch') if args[0] == 'systemd-run' else None) or result())
     monkeypatch.setattr(app, 'stop_probe', lambda: events.append('stop-owned'))
     class Response:
         def read(self, *_):
@@ -1299,10 +1310,10 @@ def test_renew_interrupt_aborts_acme_and_does_not_apply_certificate(app, config,
     def interrupt(*_args, **_kwargs):
         raise KeyboardInterrupt
     monkeypatch.setattr(app, 'run', interrupt)
-    monkeypatch.setattr(app, 'abort_acme', lambda: events.append('abort'))
+    monkeypatch.setattr(app, 'abort_acme', lambda *args: events.append('abort'))
     with pytest.raises(KeyboardInterrupt):
         app.renew(config)
-    assert events == ['abort']
+    assert events == ['abort', 'abort']
 
 
 @pytest.mark.parametrize('success', [True, False])

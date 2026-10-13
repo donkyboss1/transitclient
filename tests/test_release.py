@@ -19,7 +19,9 @@ def builder(tmp_path, monkeypatch):
                  'terminal_ui.py', 'client_panel.py',
                  'VERSION', 'dependencies.json', 'templates.json', 'README.md', 'LICENSE', 'NOTICE.md'):
         (source / name).write_text(name, encoding='utf-8')
-    for name in ('docs/integration.md', 'docs/operations.md', 'vendor/acme.sh',
+    for name in ('AGENTS.md', 'docs/installer-spec.md', 'docs/installer-firewall-lifecycle-redesign-spec.md',
+                 'docs/new-requirements.md', 'docs/terminal-interface.md', 'tests/AGENTS.md',
+                 'docs/integration.md', 'docs/operations.md', 'vendor/acme.sh',
                  'site/index.html', 'tests/test_release.py', 'tests/__pycache__/cached.pyc'):
         path = source / name
         path.parent.mkdir(exist_ok=True, parents=True)
@@ -39,6 +41,7 @@ def test_release_includes_helpers_docs_and_pins_without_state(builder, tmp_path)
                 'terminal_ui.py', 'client_panel.py',
                 'docs/operations.md', 'vendor/acme.sh', 'dependencies.json'} <= names
         assert '.env' not in names
+        assert not any('AGENTS.md' in name or 'spec' in name or 'requirements' in name or 'terminal-interface' in name for name in names)
         assert not any('__pycache__' in name or name.endswith('.pyc') for name in names)
         assert archive.getmember('selfsteal.sh').mode == 0o755
         assert all(member.isfile() for member in archive.getmembers())

@@ -230,11 +230,25 @@ def test_menu_fits_and_all_actions_remain(ui, app, monkeypatch, width, height, s
     monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda *_: (width, height))
     terminal = ui.Terminal(no_color=True)
     ui.draw(terminal, app, screen, notice)
-    text = output.getvalue().replace('\x1b[2J\x1b[H', '')
+    text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output.getvalue())
     assert len(text.splitlines()) + 1 <= height
     assert all(ui.display_width(line) <= width for line in text.splitlines())
     for number in range(12 if screen == 'sites' else 10):
         assert str(number) + ')' in text
+
+
+def test_box_drawing_divider_does_not_reserve_an_emoji_cell(ui):
+    output = io.StringIO()
+    ui.CellStream(output, 48).write('─' * 48 + '\n')
+    assert output.getvalue() == '─' * 48 + '\n'
+
+
+def test_firewall_setting_dispatch_and_back(app, ui, monkeypatch):
+    called = []
+    monkeypatch.setattr(app, 'perform', lambda selected: called.append((selected.command, selected._configure_choice)) or 0)
+    inputs(monkeypatch, ['2', '5', '', '0', '0'])
+    assert ui.run(app, args()) == 0
+    assert called == [('configure', '5')]
 
 
 def test_unicode_width_and_hostile_metadata(ui):

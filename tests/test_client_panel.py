@@ -55,7 +55,8 @@ def docker_runner(calls, *, state='running', labels=None, ids='abc123456789'):
         elif args[:2] == ['docker', 'inspect']:
             output = '|'.join(json.dumps(item) for item in [state, *(labels or ['true', 'a' * 32, 'caddy'])])
         elif args[0] == 'systemctl':
-            output = 'UnitFileState=enabled\nActiveState=active\nNextElapseUSecRealtime=Sun 2026-10-11 05:00:00 UTC\n'
+            output = ('ActiveState=inactive\nResult=success\n' if 'tenant-selfsteal-renew.service' in args else
+                      'UnitFileState=enabled\nActiveState=active\nNextElapseUSecRealtime=Sun 2026-10-11 05:00:00 UTC\n')
         return SimpleNamespace(returncode=0 if output is not None else 1, stdout=output or '', stderr='PRIVATE')
     return run
 
@@ -259,6 +260,8 @@ def test_timer_disabled_and_unknown_are_distinct(panel, app, monkeypatch, timer,
     base = docker_runner([])
     def run(args, **kwargs):
         if args[0] == 'systemctl':
+            if 'tenant-selfsteal-renew.service' in args:
+                return SimpleNamespace(returncode=0, stdout='ActiveState=inactive\nResult=success\n', stderr='')
             return SimpleNamespace(returncode=0 if timer is not None else 1, stdout=timer or '', stderr='')
         return base(args, **kwargs)
     monkeypatch.setattr(panel.subprocess, 'run', run)

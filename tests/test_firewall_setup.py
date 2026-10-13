@@ -33,7 +33,7 @@ def report():
 
 @pytest.fixture
 def config():
-    return dict(firewall='ufw', challenge_port=8080)
+    return dict(firewall='ufw', challenge_port=8080, vpn_port=443, install_id='a' * 32)
 
 
 class Runner:
@@ -42,10 +42,8 @@ class Runner:
         self.status = 'inactive'
         self.added = 'Added user rules (see \'ufw status\' for running firewall):\n'
         self.tcp = ('LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=12,fd=3))\n'
-                    'LISTEN 0 4096 *:443 *:* users:(("rw-core",pid=15,fd=7))\n'
-                    'LISTEN 0 4096 *:2222 *:* users:(("rw-node",pid=14,fd=4))\n')
-        self.udp = ('UNCONN 0 0 127.0.0.53:53 0.0.0.0:* users:(("systemd-resolved",pid=3,fd=4))\n'
-                    'UNCONN 0 0 *:51820 *:* users:(("service",pid=20,fd=5))\n')
+                    'LISTEN 0 4096 *:443 *:* users:(("rw-core",pid=15,fd=7))\n')
+        self.udp = 'UNCONN 0 0 127.0.0.53:53 0.0.0.0:* users:(("systemd-resolved",pid=3,fd=4))\n'
         self.saved = '*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n'
         self.nft = '{"nftables":[]}'
         self.vendor = '\n'.join(' ' + str(p) + ' ' + hashlib.md5(p.read_bytes()).hexdigest() for p in fw.UFW_DIR.iterdir())
@@ -98,12 +96,11 @@ def patch_collect(monkeypatch, report):
     monkeypatch.setattr(diagnostics, 'collect', lambda _: report)
 
 
-def test_inactive_plan_preserves_host_node_and_ssh_and_udp(fw, config, report):
+def test_inactive_plan_only_opens_confirmed_ssh_and_selected_vpn(fw, config, report):
     run = Runner(fw)
     prepared = fw.plan(config, report, run)
     assert prepared['mode'] == 'inactive'
-    assert prepared['rules'] == [dict(port=22, protocol='tcp'), dict(port=443, protocol='tcp'),
-                                dict(port=2222, protocol='tcp'), dict(port=51820, protocol='udp')]
+    assert prepared['rules'] == [dict(port=22, protocol='tcp'), dict(port=443, protocol='tcp')]
     assert not any(a[:2] == ['ufw', '--force'] or a[:2] == ['ufw', 'prepend'] for a in run.calls)
 
 
@@ -112,7 +109,8 @@ def test_active_plan_never_enables_or_adds_service_rules(fw, config, report, tmp
     run.status = 'active'
     prepared = fw.plan(config, report, run)
     assert fw.apply(prepared, config, tmp_path / 'state', run, atomic)['status'] == 'unchanged'
-    assert run.calls == [['ufw', 'status'], ['dpkg-query', '-W', '-f=${Conffiles}', 'ufw'],
+    assert run.calls == [['ufw', 'status'], ['iptables-save'], ['ip6tables-save'], ['nft', '--json', 'list', 'ruleset'],
+                         ['dpkg-query', '-W', '-f=${Conffiles}', 'ufw'],
                          ['ufw', 'show', 'added']]
 
 
@@ -164,7 +162,7 @@ def test_confirmed_nonstandard_ssh_port_is_preserved(fw, config, report, monkeyp
     monkeypatch.setenv('SSH_CONNECTION', '8.8.8.8 45000 1.1.1.1 2022')
     prepared = fw.plan(config, report, run)
     assert dict(port=2022, protocol='tcp') in prepared['rules']
-    assert dict(port=22, protocol='tcp') in prepared['rules']
+    assert dict(port=22, protocol='tcp') not in prepared['rules']
 
 
 def test_native_filters_and_modified_before_rules_block(fw, config, report):
@@ -235,21 +233,22 @@ def test_active_custom_before_rules_block_challenge(fw):
         fw.check_challenge_rules(run, 8080)
 
 
-def test_backup_rules_watchdog_enable_verify_cancel_order(fw, config, report, tmp_path, monkeypatch):
+def test_backup_rules_watchdog_enable_wait_for_new_ssh_order(fw, config, report, tmp_path, monkeypatch):
     patch_collect(monkeypatch, report)
     run = Runner(fw)
     prepared = fw.plan(config, report, run)
     state = tmp_path / 'state'
     result = fw.apply(prepared, config, state, run, atomic)
-    assert result['status'] == 'active'
+    assert result['status'] == 'awaiting-confirmation'
     assert (Path(result['backup']) / 'ufw' / 'before.rules').read_bytes() == (fw.UFW_DIR / 'before.rules').read_bytes()
-    assert not (state / 'ufw-activation.json').exists()
+    assert (state / 'ufw-activation.json').exists()
     calls = run.calls
     first_rule = next(i for i, a in enumerate(calls) if a[:3] == ['ufw', 'prepend', 'allow'])
     arm = next(i for i, a in enumerate(calls) if a[0] == 'systemd-run')
     enable = calls.index(['ufw', '--force', 'enable'])
-    stop = next(i for i, a in enumerate(calls) if a[:2] == ['systemctl', 'stop'])
-    assert first_rule < arm < enable < stop
+    assert first_rule < arm < enable
+    assert not any(a[:2] == ['systemctl', 'stop'] for a in calls)
+    assert '--on-active=180s' in calls[arm]
     assert '8080/tcp' not in run.rules
     assert not any('reset' in a or 'default' in a or 'delete' in a for a in calls)
 
@@ -306,7 +305,7 @@ def test_missing_package_backed_up_before_install_and_replanned(fw, config, repo
     prepared = fw.plan(config, report, installing)
     assert prepared['mode'] == 'missing'
     result = fw.apply(prepared, config, state, installing, atomic)
-    assert result['status'] == 'active'
+    assert result['status'] == 'awaiting-confirmation'
     assert result['before_install_backup']
 
 
@@ -331,3 +330,93 @@ def test_builtin_flush_setting_is_refused(fw, config, report):
     fw.UFW_DEFAULT.write_text('IPV6=yes\nMANAGE_BUILTINS=yes\nDEFAULT_OUTPUT_POLICY="ACCEPT"\n')
     with pytest.raises(fw.FirewallError):
         fw.plan(config, report, Runner(fw))
+
+
+@pytest.mark.parametrize('active', [False, True])
+def test_auto_preserves_native_inet_even_when_named_sets_are_empty(fw, config, report, active):
+    config['firewall'] = 'auto'
+    run = Runner(fw)
+    run.status = 'active' if active else 'inactive'
+    run.nft = json.dumps({'nftables': [
+        {'set': {'family': 'inet', 'table': 'remna', 'name': 'whitelist', 'elem': []}},
+        {'chain': {'family': 'inet', 'table': 'remna', 'name': 'input', 'hook': 'input', 'prio': -1, 'policy': 'accept'}},
+        {'rule': {'family': 'inet', 'table': 'remna', 'chain': 'input', 'expr': [{'drop': None}]}}]})
+    prepared = fw.plan(config, report, run)
+    assert prepared['mode'] == prepared['effective'] == 'preserve'
+    assert not any(a[0] in ('apt-get', 'systemd-run') or a[:2] == ['ufw', 'prepend'] for a in run.calls)
+
+
+@pytest.mark.parametrize('active', [False, True])
+def test_auto_fail2ban_never_aborts_install_or_overrides_bans(fw, config, report, active):
+    config['firewall'] = 'auto'
+    run = Runner(fw)
+    run.status = 'active' if active else 'inactive'
+    run.saved += '-A INPUT -m set --match-set f2b-sshd src -j REJECT\n'
+    prepared = fw.plan(config, report, run)
+    assert prepared['mode'] == 'preserve'
+    assert prepared['reason'] == 'FIREWALL_FAIL2BAN_PRESENT'
+    assert not run.rules
+
+
+def test_auto_bridge_uses_preserve(fw, config, report):
+    config['firewall'] = 'auto'
+    report['docker']['containers'][0]['network_mode'] = 'bridge'
+    assert fw.plan(config, report, Runner(fw))['mode'] == 'preserve'
+
+
+@pytest.mark.parametrize('port', [80, 2222, 9443, 51820])
+def test_unknown_public_listener_is_never_permanently_allowed(fw, config, report, port):
+    config['firewall'] = 'auto'
+    run = Runner(fw)
+    run.tcp += f'LISTEN 0 128 *:{port} *:* users:(("unknown",pid=50,fd=3))\n'
+    prepared = fw.plan(config, report, run)
+    assert prepared['mode'] == 'preserve' and prepared['rules'] == []
+    assert prepared['reason'] == 'FIREWALL_LISTENER_UNCLASSIFIED'
+
+
+def test_saved_effective_policy_is_not_reselected_on_cleaner_host(fw, config, report):
+    config.update(firewall='auto', firewall_effective='preserve')
+    def forbidden(*_, **__):
+        pytest.fail('Saved preserve mode must not reconsider firewall activation')
+    assert fw.plan(config, report, forbidden)['effective'] == 'preserve'
+
+
+@pytest.mark.parametrize('fresh', [False, True])
+def test_only_fresh_ssh_proof_can_cancel_activation_rollback(fw, config, report, tmp_path, monkeypatch, fresh):
+    patch_collect(monkeypatch, report)
+    run = Runner(fw)
+    state = tmp_path / 'state'
+    journal = fw.apply(fw.plan(config, report, run), config, state, run, atomic)
+    monkeypatch.setattr(fw, 'fresh_ssh', lambda *args: fresh)
+    before = len(run.calls)
+    if fresh:
+        fw.confirm_activation(state, config, journal['token'], run, atomic)
+        assert not (state / 'ufw-activation.json').exists()
+        assert json.loads((state / 'ufw-setup.json').read_text())['status'] == 'active'
+    else:
+        with pytest.raises(fw.FirewallError) as error:
+            fw.confirm_activation(state, config, journal['token'], run, atomic)
+        assert error.value.code == 'FIREWALL_FRESH_SSH_REQUIRED'
+        assert (state / 'ufw-activation.json').exists()
+        assert not any(a[:2] == ['systemctl', 'stop'] for a in run.calls[before:])
+
+
+@pytest.mark.parametrize('old_transport', [False, True])
+def test_fresh_ssh_rejects_new_channel_on_existing_controlmaster(fw, tmp_path, monkeypatch, old_transport):
+    proc = tmp_path / 'proc'
+    proc.mkdir()
+    for pid, parent, started in [(300, 200, 110000), (200, 100, 90000), (100, 1, 100)]:
+        directory = proc / str(pid)
+        directory.mkdir()
+        values = ['S', str(parent)] + ['0'] * 17 + [str(started)]
+        (directory / 'stat').write_text(str(pid) + ' (sshd) ' + ' '.join(values))
+        (directory / 'comm').write_text('sshd\n')
+    monkeypatch.setattr(fw, 'Path', lambda value: proc if value == '/proc' else Path(value))
+    monkeypatch.setattr(fw.os, 'getppid', lambda: 300)
+    monkeypatch.setattr(fw.os, 'sysconf', lambda _: 100, raising=False)
+    monkeypatch.setenv('SSH_CONNECTION', '8.8.8.8 50000 1.1.1.1 2022')
+    owners = 'pid=300' + (',pid=200' if old_transport else '')
+    def run(*_, **__):
+        return SimpleNamespace(returncode=0, stdout=('0 0 1.1.1.1:2022 8.8.8.8:50000 users:((' + owners + '))').encode())
+    journal = dict(activated_uptime=1000, rules=[dict(port=2022, protocol='tcp')])
+    assert fw.fresh_ssh(journal, run) is not old_transport

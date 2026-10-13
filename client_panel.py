@@ -93,18 +93,23 @@ def _caddy(config, budget):
 
 
 def _renewal(budget):
+    from renewal_schedule import PROPERTIES, fields, health
     output = budget.run(['systemctl', 'show', 'tenant-selfsteal-renew.timer',
-                         '-p', 'UnitFileState', '-p', 'ActiveState', '-p', 'NextElapseUSecRealtime'])
-    fields = dict(line.split('=', 1) for line in (output or '').splitlines() if '=' in line)
-    enabled = fields.get('UnitFileState') == 'enabled'
-    active = fields.get('ActiveState') == 'active'
-    next_time = fields.get('NextElapseUSecRealtime', '')
-    valid_time = bool(_NEXT_TIME.fullmatch(next_time))
-    if enabled and active and valid_time:
+                         *[part for prop in PROPERTIES for part in ('-p', prop)]])
+    timer = fields(output or '')
+    service = fields(budget.run(['systemctl', 'show', 'tenant-selfsteal-renew.service',
+                                '-p', 'ActiveState', '-p', 'Result']) or '')
+    state = health(timer, service)
+    next_time = timer.get('NextElapseUSecRealtime', '')
+    if state == 'waiting':
         return '✅ Включено · следующий: ' + next_time, True
-    if fields.get('UnitFileState') in ('disabled', 'masked', 'masked-runtime') or fields.get('ActiveState') in ('inactive', 'failed'):
+    if state == 'running':
+        return '✅ Включено · проверка продления выполняется', True
+    if state == 'service_failed':
+        return '⚠ Расписание включено · последняя проверка завершилась ошибкой', False
+    if timer.get('UnitFileState') in ('disabled', 'masked', 'masked-runtime') or timer.get('ActiveState') in ('inactive', 'failed'):
         return '⏹ Выключено · автоматическое продление не подтверждено', False
-    if enabled and active:
+    if timer.get('UnitFileState') == 'enabled' and timer.get('ActiveState') == 'active':
         return '⚠ Включено · следующий запуск неизвестен', False
     return '⚠ Неизвестно · автоматическое продление не подтверждено', False
 
@@ -171,7 +176,7 @@ def _site(app):
 
 
 def _pending(app):
-    journals = ('firewall.json', 'certificate-transaction.json', 'configuration-transaction.json',
+    journals = ('operation.json', 'uninstall.json', 'firewall.json', 'certificate-transaction.json', 'configuration-transaction.json',
                 'update-transaction.json', 'site-transaction.json', 'ufw-activation.json')
     if any((app.STATE / name).exists() for name in journals):
         return True

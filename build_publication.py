@@ -6,7 +6,7 @@ import shutil
 import tarfile
 import tempfile
 
-from build_release import build
+from build_release import PRIVATE_IGNORE, build
 
 
 REPOSITORY = 'donkyboss1/transitclient'
@@ -61,7 +61,7 @@ def prepare(destination):
     for name, contents in {
         'install.sh': script,
         '.gitattributes': '* text=auto eol=lf\n*.tar.gz -text\n',
-        '.gitignore': '__pycache__/\n*.py[cod]\n.pytest_cache/\n.ruff_cache/\n.venv/\n.cache/\n.tools/\n.test-tmp*/\n.env\n*.log\n',
+        '.gitignore': '__pycache__/\n*.py[cod]\n.pytest_cache/\n.ruff_cache/\n.venv/\n.cache/\n.tools/\n.test-tmp*/\n.env\n*.log\n' + PRIVATE_IGNORE,
     }.items():
         target = destination / name
         if target.is_symlink():

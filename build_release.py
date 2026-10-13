@@ -7,6 +7,10 @@ from pathlib import Path
 import tarfile
 
 
+PUBLIC_DOCS = {'implementation.md', 'integration.md', 'operations.md', 'publication.md'}
+PRIVATE_IGNORE = 'AGENTS.md\n**/AGENTS.md\ndocs/*spec*.md\ndocs/*requirements*.md\ndocs/terminal-interface.md\n'
+
+
 def build(destination, root=None):
     root = Path(root).resolve() if root is not None else Path(__file__).resolve().parent
     sources = ['selfsteal.sh', 'VERSION', 'dependencies.json', 'templates.json', 'README.md', 'LICENSE', 'NOTICE.md']
@@ -16,7 +20,9 @@ def build(destination, root=None):
     for directory in ('vendor', 'site', 'tests', 'docs'):
         sources.extend(str(path.relative_to(root)).replace('\\', '/')
                        for path in (root / directory).rglob('*')
-                       if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc')
+                       if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc'
+                       and path.name.casefold() != 'agents.md'
+                       and (directory != 'docs' or path.relative_to(root / 'docs').as_posix() in PUBLIC_DOCS))
     destination = destination.resolve()
     if destination == root or root in destination.parents:
         raise ValueError('Store the release outside the source package directory.')

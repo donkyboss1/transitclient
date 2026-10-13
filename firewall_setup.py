@@ -1,4 +1,4 @@
-"""Offline-planned UFW activation preserving SSH and current host listeners.
+"""Conservative firewall planning: preserve complex hosts, manage simple UFW.
 
 No reset, policy changes, foreign rule deletion or Docker network mutations.
 The persistent service allowances deliberately survive client uninstallation.
@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import time
 import uuid
 
 
@@ -70,7 +71,7 @@ def _docker_chain(value):
     return bool(re.fullmatch(r'DOCKER(?:-[A-Z0-9-]+)?', value))
 
 
-def _native_filters(run, docker_host_only=False):
+def _native_filters(run, docker_host_only=False, active_ufw=False):
     evidence = []
     for command in ('iptables-save', 'ip6tables-save'):
         text = _read(run, [command])
@@ -92,7 +93,7 @@ def _native_filters(run, docker_host_only=False):
                 continue
             if docker_host_only and re.match(r':FORWARD DROP\b', line):
                 continue
-            if re.match(r':(?:INPUT|OUTPUT|FORWARD) (?!ACCEPT\b)', line):
+            if not active_ufw and re.match(r':(?:INPUT|OUTPUT|FORWARD) (?!ACCEPT\b)', line):
                 raise FirewallError('Обнаружена чужая политика firewall; автоматическое включение запрещено.')
             if line.startswith('-A '):
                 args = shlex.split(line)
@@ -105,6 +106,8 @@ def _native_filters(run, docker_host_only=False):
                                         'может изменить порядок блокировок; требуется согласованная интеграция. '
                                         'Для сохранения текущего firewall используйте install --firewall manual.',
                                         'FIREWALL_FAIL2BAN_PRESENT')
+                if active_ufw and (chain.startswith('ufw-') or chain in ('INPUT', 'OUTPUT', 'FORWARD') and target.startswith('ufw-')):
+                    continue
                 if docker_host_only and (chain == 'FORWARD' and _docker_chain(target)):
                     continue
                 if docker_host_only and _docker_chain(chain) and target in ('RETURN', 'ACCEPT', 'DROP'):
@@ -123,6 +126,15 @@ def _native_filters(run, docker_host_only=False):
                 # base policy, rate limiting, queues, sets or interface filters.
                 for kind in ('rule', 'chain'):
                     value = item.get(kind)
+                    ufw_owned = bool(value and active_ufw and value.get('family') in ('ip', 'ip6')
+                                     and value.get('table') == 'filter' and (
+                                         value.get('chain', value.get('name', '')).startswith('ufw-') or
+                                         kind == 'chain' and value.get('name') in ('INPUT', 'OUTPUT', 'FORWARD') or
+                                         kind == 'rule' and value.get('chain') in ('INPUT', 'OUTPUT', 'FORWARD')
+                                         and all(set(expr) == {'jump'} and expr['jump'].get('target', '').startswith('ufw-')
+                                                 for expr in value.get('expr', []))))
+                    if ufw_owned:
+                        continue
                     if value and value.get('family') not in (None, 'ip', 'ip6'):
                         raise FirewallError('Нестандартное семейство nftables требует ручной проверки.')
                     docker_forward = bool(value and docker_host_only and value.get('table') == 'filter'
@@ -238,11 +250,27 @@ def check_challenge_rules(run, port, *, check_vendor=True):
 
 def plan(config, report, run):
     """Read-only JSON-serializable activation plan; raise for uncertain safety."""
-    if config.get('firewall') == 'manual':
-        return dict(mode='manual', rules=[], changes=[], fingerprint='manual')
+    requested = config.get('firewall_effective', config.get('firewall', 'auto'))
+    if requested in ('manual', 'preserve'):
+        return dict(mode=requested, effective='preserve', rules=[], changes=[
+                    'Сохранить существующий firewall; временные разрешения также настраиваются владельцем.'], fingerprint=requested)
+    try:
+        prepared = _ufw_plan(config, report, run)
+    except FirewallError as exc:
+        if requested != 'auto':
+            raise FirewallError(str(exc) + ' Чтобы продолжить без изменения firewall, используйте --firewall preserve.', exc.code) from exc
+        return dict(mode='preserve', effective='preserve', rules=[], fingerprint='preserve',
+                    reason=exc.code, changes=['Режим auto выбрал preserve: ' + str(exc),
+                    'Текущие UFW/nftables/Docker/Fail2Ban правила сохраняются.'])
+    prepared['effective'] = 'ufw'
+    return prepared
+
+
+def _ufw_plan(config, report, run):
     installed = report.get('dependencies', {}).get('ufw', False)
     status = _read(run, ['ufw', 'status']) if installed else ''
     if 'Status: active' in status:
+        _native_filters(run, bool(report.get('docker', {}).get('inventory_complete')), active_ufw=True)
         check_challenge_rules(run, config['challenge_port'])
         # Existing active firewall and service rules are never changed here.
         return dict(mode='active', rules=[], changes=['UFW уже включён; SSH, службы и политики сохраняются.'],
@@ -265,7 +293,12 @@ def plan(config, report, run):
     ssh_ports = {port for port, protocol, is_ssh in listeners if is_ssh and protocol == 'tcp'}
     if not ssh_ports:
         raise FirewallError('SSH-слушатель не подтверждён; включение UFW запрещено.')
-    required = {(port, protocol) for port, protocol, _ in listeners} | {(22, 'tcp')}
+    vpn = config.get('vpn_port')
+    required = {(port, protocol) for port, protocol, ssh in listeners if ssh or protocol == 'tcp' and port == vpn}
+    unknown = [(port, protocol) for port, protocol, ssh in listeners if not ssh and not (protocol == 'tcp' and port == vpn)]
+    if unknown:
+        raise FirewallError('Есть публичные слушатели с неподтверждённым назначением. Их доступ не будет расширен; '
+                            'для сохранения доступности выберите preserve.', 'FIREWALL_LISTENER_UNCLASSIFIED')
     connection = os.environ.get('SSH_CONNECTION')
     if connection:
         try:
@@ -292,7 +325,7 @@ def plan(config, report, run):
     changes = ([] if installed else ['Установить пакет UFW и повторить проверки.']) + [
         'Сохранить резервную копию UFW.',
         'Сохранить доступ: ' + ', '.join(f"{r['port']}/{r['protocol']}" for r in rules) + '.',
-        'Включить UFW с независимым автоматическим откатом через 60 секунд.',
+        'Включить UFW с откатом через 180 секунд; подтвердить из НОВОГО SSH-соединения.',
         f"TCP {int(config['challenge_port'])} открывать только на время выпуска/продления сертификата.",
     ]
     return dict(mode='inactive' if installed else 'missing', rules=rules, changes=changes,
@@ -320,7 +353,7 @@ def _backup(state):
 
 def apply(prepared, config, state, run, atomic_json):
     """Apply already-approved plan. Caller owns installation lock/confirmation."""
-    if prepared['mode'] in ('manual', 'active'):
+    if prepared['mode'] in ('manual', 'preserve', 'active'):
         return dict(status='unchanged', mode=prepared['mode'])
     if hasattr(os, 'geteuid') and os.geteuid() != 0:
         raise FirewallError('Подготовка UFW требует root.')
@@ -362,7 +395,10 @@ def apply(prepared, config, state, run, atomic_json):
     script.write_text('#!/bin/sh\nset -eu\n/usr/sbin/ufw --force disable\n'
                       + 'touch ' + shlex.quote(str(fired)) + '\nchmod 600 ' + shlex.quote(str(fired)) + '\n')
     os.chmod(script, 0o700)
-    journal = dict(status='prepared', backup=str(backup), unit=unit, rules=current['rules'], original='inactive')
+    journal = dict(status='prepared', backup=str(backup), unit=unit, rules=current['rules'], original='inactive',
+                   install_id=config.get('install_id'), token=uuid.uuid4().hex,
+                   activated_uptime=float(Path('/proc/uptime').read_text().split()[0]) if os.name == 'posix' else 0,
+                   deadline=int(time.time()) + 180)
     if before_install:
         journal['before_install_backup'] = str(before_install)
     atomic_json(marker, journal)
@@ -370,10 +406,11 @@ def apply(prepared, config, state, run, atomic_json):
     try:
         for rule in current['rules']:
             run(['ufw', 'prepend', 'allow', f"{rule['port']}/{rule['protocol']}", 'comment', 'transitclient-preserve'])
-        run(['systemd-run', '--unit=' + unit, '--on-active=60s', '--timer-property=AccuracySec=1s',
+        run(['systemd-run', '--unit=' + unit, '--on-active=180s', '--timer-property=AccuracySec=1s',
              '--description=Transitclient UFW activation rollback', '/bin/sh', str(script)])
         armed = True
         journal['status'] = 'enabling'
+        journal['activated_uptime'] = float(Path('/proc/uptime').read_text().split()[0]) if os.name == 'posix' else 0
         atomic_json(marker, journal)
         run(['ufw', '--force', 'enable'])
         status = _read(run, ['ufw', 'status', 'numbered'])
@@ -383,14 +420,9 @@ def apply(prepared, config, state, run, atomic_json):
             for family in ('', r'\s+\(v6\)'):
                 if not re.search(r'\]\s+' + re.escape(f"{rule['port']}/{rule['protocol']}") + family + r'\s+ALLOW IN\s+Anywhere\b', status):
                     raise FirewallError('Разрешение служебного порта IPv4/IPv6 не подтверждено; выполняется откат.')
-        # Cancel timer, wait for any concurrently running rollback, then recheck.
-        run(['systemctl', 'stop', unit + '.timer', unit + '.service'])
-        if fired.exists() or 'Status: active' not in _read(run, ['ufw', 'status']):
-            raise FirewallError('Сработал защитный откат UFW; повторите диагностику.')
-        armed = False
-        journal['status'] = 'active'
-        atomic_json(state / 'ufw-setup.json', journal)
-        marker.unlink()
+        # An existing SSH stream / local status cannot prove new inbound access.
+        journal['status'] = 'awaiting-confirmation'
+        atomic_json(marker, journal)
         return journal
     except BaseException:
         if armed:
@@ -403,6 +435,65 @@ def apply(prepared, config, state, run, atomic_json):
         journal['status'] = 'needs-review'
         atomic_json(marker, journal)
         raise
+
+
+def fresh_ssh(journal, run):
+    """Require a new sshd ancestor and its live, matching transport socket."""
+    connection = os.environ.get('SSH_CONNECTION', '').split()
+    if len(connection) != 4 or journal.get('activated_uptime') is None:
+        return False
+    peer, peer_port, local, port = connection
+    try:
+        ipaddress.ip_address(peer)
+        ipaddress.ip_address(local)
+        int(peer_port)
+        if int(port) not in [r['port'] for r in journal['rules'] if r['protocol'] == 'tcp']:
+            return False
+        sockets = _read(run, ['ss', '-H', '-tnp', 'state', 'established'])
+        transport = [line for line in sockets.splitlines() if (
+                     f'{peer}:{peer_port}' in line or f'[{peer}]:{peer_port}' in line) and (
+                     f'{local}:{port}' in line or f'[{local}]:{port}' in line)]
+        proved = False
+        pid = os.getppid()
+        for _ in range(32):
+            root = Path('/proc') / str(pid)
+            stat = (root / 'stat').read_text().rsplit(')', 1)[1].split()
+            executable = (root / 'comm').read_text().strip()
+            started = int(stat[19]) / os.sysconf('SC_CLK_TCK')
+            if executable.startswith('sshd') and any(re.search(r'\bpid=' + str(pid) + r'\b', line) for line in transport):
+                # A newly forked channel on an old ControlMaster transport must
+                # not validate activation. Check every socket-owning ancestor.
+                if started <= journal['activated_uptime']:
+                    return False
+                proved = True
+            pid = int(stat[1])
+            if pid <= 1:
+                break
+        return proved
+    except (OSError, ValueError, IndexError):
+        return False
+    return False
+
+
+def confirm_activation(state, config, token, run, atomic_json):
+    marker = Path(state) / 'ufw-activation.json'
+    if not marker.exists():
+        raise FirewallError('Ожидающей подтверждения активации UFW нет.')
+    journal = json.loads(marker.read_text())
+    if (journal.get('install_id') != config.get('install_id') or journal.get('token') != token
+            or journal.get('status') != 'awaiting-confirmation' or journal.get('deadline', 0) <= time.time()
+            or not re.fullmatch(r'transitclient-ufw-rollback-[0-9a-f]{32}', journal.get('unit', ''))):
+        raise FirewallError('Подтверждение активации недействительно; откат остаётся включён.')
+    if not fresh_ssh(journal, run):
+        raise FirewallError('Подключитесь по SSH заново после включения UFW и повторите команду. '
+                            'Старое соединение не подтверждает доступ.', 'FIREWALL_FRESH_SSH_REQUIRED')
+    run(['systemctl', 'stop', journal['unit'] + '.timer', journal['unit'] + '.service'])
+    if (Path(journal['backup']) / 'rollback-fired').exists() or 'Status: active' not in _read(run, ['ufw', 'status']):
+        raise FirewallError('Откат уже сработал; повторите диагностику.')
+    journal['status'] = 'active'
+    atomic_json(Path(state) / 'ufw-setup.json', journal)
+    marker.unlink()
+    return journal
 
 
 def recover_activation(state, run, atomic_json):

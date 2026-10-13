@@ -8,3 +8,8 @@ __pycache__/
 .test-tmp*/
 .env
 *.log
+AGENTS.md
+**/AGENTS.md
+docs/*spec*.md
+docs/*requirements*.md
+docs/terminal-interface.md

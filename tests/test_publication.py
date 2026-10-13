@@ -35,7 +35,11 @@ def test_publication_bootstrap_pins_complete_export(publication_module, tmp_path
     assert f"RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/{bundle.name}'" in script
     assert 'bootstrap=true' in script
     assert 'Публичный адрес пока не назначен' not in script
-    assert not any((destination / name).exists() for name in ('.env', 'AGENTS.MD', 'backend', '.git'))
+    assert not any((destination / name).exists() for name in ('.env', 'AGENTS.md', 'backend', '.git',
+                    'docs/installer-spec.md', 'docs/installer-firewall-lifecycle-redesign-spec.md',
+                    'docs/http01-requirements.md', 'docs/terminal-interface.md'))
+    assert 'AGENTS.md' in (destination / '.gitignore').read_text()
+    assert 'docs/*spec*.md' in (destination / '.gitignore').read_text()
     assert {'install.sh', 'selfsteal.py', 'diagnostics.py', 'README.md'} <= {path.name for path in destination.iterdir()}
     assert 'Copyright (c) 2026 donkyboss1' in (destination / 'LICENSE').read_text()
     assert 'Copyright (c) 2025-2026 DigneZzZ' in (destination / 'LICENSE').read_text()

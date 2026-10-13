@@ -47,6 +47,7 @@ ACME_TIMEOUT = 900
 LAUNCHER = Path('/usr/local/bin/transitclient')
 ADMIN = 'unix//config/transitclient-admin.sock'
 _menu_tls_check = {}
+_operation_id = None
 
 
 class Failure(Exception):
@@ -216,8 +217,10 @@ def validate_config(config):
         if not ip.is_global:
             raise Failure('Ожидаемый IP релея должен быть публичным.')
         config['relay_ip'] = str(ip)
-    if config['firewall'] not in ('ufw', 'manual'):
-        raise Failure('Поддерживается active UFW или явно подтверждённый manual firewall.')
+    if config['firewall'] not in ('auto', 'ufw', 'preserve', 'manual'):
+        raise Failure('Выберите auto, ufw или preserve (manual — прежнее имя preserve).')
+    if config.get('firewall_effective') not in (None, 'ufw', 'preserve'):
+        raise Failure('Неизвестная сохранённая политика firewall.')
     if config['ca'] not in (PRODUCTION, STAGING):
         raise Failure("CA должна быть production или staging Let's Encrypt.")
     if config['ca'] == STAGING and not config.get('staging_ca_file'):
@@ -304,15 +307,140 @@ def require_host():
 
 
 @contextlib.contextmanager
-def lifecycle_lock():
+def lifecycle_lock(wait=0):
     import fcntl
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     with LOCK.open('a') as handle:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise Failure('Другая операция Transit Client уже выполняется. Повторите позже.',
+                                  'OPERATION_BUSY') from exc
+                time.sleep(0.2)
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise Failure('Установка/продление/обновление уже выполняется.') from exc
-        yield
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def resource_lock():
+    """Hooks use a short independent lock; never wait for their parent's lock."""
+    path = STATE / 'resources.lock'
+    with path.open('a+b') as handle:
+        if os.name == 'posix':
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        else:
+            import msvcrt
+            handle.write(b'\0')
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if os.name == 'posix':
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            else:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def operation_record(identifier):
+    if not identifier or not re.fullmatch(r'[0-9a-f]{32}', identifier):
+        return None
+    path = STATE / 'operation.json'
+    record = read_json(path) if path.exists() else None
+    if record and record.get('operation_id') == identifier:
+        if CONFIG.exists() and record.get('install_id') != read_json(CONFIG).get('install_id'):
+            raise Failure('Владелец операции не подтверждён.', 'OWNERSHIP_UNKNOWN')
+        return record
+    return None
+
+
+@contextlib.contextmanager
+def operation_scope(config, kind):
+    global _operation_id
+    if _operation_id:
+        yield _operation_id
+        return
+    if (STATE / 'operation.json').exists():
+        raise Failure('Сохранена незавершённая операция. Выполните transitclient _recover.', 'RECOVERY_REQUIRED')
+    identifier = uuid.uuid4().hex
+    if not config.get('install_id'):
+        config['install_id'] = uuid.uuid4().hex
+        if CONFIG.exists():
+            saved = read_json(CONFIG)
+            if saved.get('install_id'):
+                config['install_id'] = saved['install_id']
+            else:
+                saved['install_id'] = config['install_id']
+                atomic_json(CONFIG, saved)
+    atomic_json(STATE / 'operation.json', dict(operation_id=identifier, install_id=config['install_id'],
+                kind=kind, resources=[], started_at=int(time.time()), deadline=int(time.time()) + ACME_TIMEOUT + 120))
+    _operation_id = identifier
+    try:
+        yield identifier
+    finally:
+        try:
+            with resource_lock():
+                record = operation_record(identifier)
+                if record:
+                    record['state'] = 'closing'
+                    atomic_json(STATE / 'operation.json', record)
+            abort_acme(identifier)
+            stop_scoped_transient(identifier, 'probe')
+            path = STATE / 'operation.json'
+            if operation_record(identifier):
+                path.unlink()
+        finally:
+            _operation_id = None
+
+
+def lifecycle_stage(stage, **details):
+    config = read_json(CONFIG) if CONFIG.exists() else {}
+    old = read_json(STATE / 'lifecycle.json') if (STATE / 'lifecycle.json').exists() else {}
+    record = dict(stage=stage, install_id=config.get('install_id'), at=int(time.time()),
+                  issuance_authorized=old.get('issuance_authorized', False))
+    record.update(details)
+    atomic_json(STATE / 'lifecycle.json', record)
+
+
+def scoped_unit(identifier, kind):
+    if not re.fullmatch(r'[0-9a-f]{32}', identifier) or kind not in ('acme', 'probe', 'watchdog'):
+        raise Failure('Некорректный ресурс операции.', 'OWNERSHIP_UNKNOWN')
+    return 'tenant-selfsteal-' + kind + '-' + identifier
+
+
+def claim_resource(identifier, kind):
+    with resource_lock():
+        record = operation_record(identifier)
+        if not record or record.get('state', 'active') != 'active':
+            raise Failure('Операция уже завершена.', 'OPERATION_EXPIRED')
+        record['resources'] = sorted(set(record.get('resources', [])) | {kind})
+        atomic_json(STATE / 'operation.json', record)
+
+
+def stop_scoped_transient(identifier, kind, suffix='service'):
+    record = operation_record(identifier)
+    if not record or kind not in record.get('resources', []):
+        return
+    unit = scoped_unit(identifier, kind) + '.' + suffix
+    state = transient_state(unit)
+    if state.get('LoadState', 'not-found') == 'not-found':
+        return
+    description = 'Transitclient ' + kind + ' ' + record['install_id'] + ' ' + identifier
+    proof = state.get('Triggers') == scoped_unit(identifier, kind) + '.service' if suffix == 'timer' else (
+        (str(INSTALL / 'vendor/acme.sh') in state.get('ExecStart', '') and str(STATE / 'acme') in state.get('ExecStart', ''))
+        if kind == 'acme' else (str(INSTALL / 'selfsteal.py') in state.get('ExecStart', '') and identifier in state.get('ExecStart', '')))
+    if state.get('Description') != description or not proof:
+        raise Failure('Владелец ресурса операции не подтверждён: ' + unit, 'OWNERSHIP_UNKNOWN')
+    run(['systemctl', 'stop', unit])
 
 
 def dependency_lock():
@@ -508,11 +636,28 @@ def owned_rule_numbers(text, tag):
             if tag in line and (m := re.match(r'^\[\s*(\d+)\]', line))]
 
 
-def cleanup_firewall():
+def cleanup_firewall(identifier=None):
+    identifier = identifier or _operation_id
+    if not (STATE / 'firewall.json').exists():
+        return
+    with resource_lock():
+        record = _cleanup_firewall_locked(identifier)
+    # Stop outside the hook lock: ExecStopPost may itself run cleanup.
+    if record and record.get('operation_id'):
+        stop_scoped_transient(record['operation_id'], 'watchdog', 'timer')
+    elif record:
+        stop_owned_transient('tenant-selfsteal-watchdog.timer', 'Transitclient firewall watchdog')
+
+
+def _cleanup_firewall_locked(identifier):
     marker = STATE / 'firewall.json'
     if not marker.exists():
         return
     record = read_json(marker)
+    if record.get('operation_id') != identifier:
+        return
+    if identifier and not operation_record(identifier):
+        return
     if not re.fullmatch(r'tenant-selfsteal-[0-9a-f]{32}', record['tag']):
         raise Failure('Повреждён маркер firewall; автоматическое удаление запрещено.')
     if record['mode'] != 'ufw':
@@ -531,13 +676,23 @@ def cleanup_firewall():
         else:
             raise Failure('Не удалось удалить временные правила UFW; маркер сохранён.')
     marker.unlink()
-    stop_owned_transient('tenant-selfsteal-watchdog.timer', 'Transitclient firewall watchdog')
+    return record
 
 
-def open_firewall(config):
+def open_firewall(config, identifier=None):
+    identifier = identifier or _operation_id
     check_challenge_port(config)
-    cleanup_firewall()
-    if config['firewall'] == 'manual':
+    cleanup_firewall(identifier)
+    with resource_lock():
+        if identifier:
+            record = operation_record(identifier)
+            if not record or record.get('state', 'active') != 'active' or record['deadline'] <= time.time():
+                raise Failure('Операция завершена или её срок истёк.', 'OPERATION_EXPIRED')
+        _open_firewall_locked(config, identifier)
+
+
+def _open_firewall_locked(config, identifier):
+    if config.get('firewall_effective', config['firewall']) in ('manual', 'preserve'):
         print(f"Внешний/local firewall: TCP {config['challenge_port']} должен пропускать "
               'все источники на время ACME. Автоматические правила не изменяются.')
         return
@@ -550,14 +705,23 @@ def open_firewall(config):
     except firewall.FirewallError as exc:
         raise Failure(str(exc), exc.code) from exc
     tag = 'tenant-selfsteal-' + uuid.uuid4().hex
-    assert_transient_available('tenant-selfsteal-watchdog.timer')
-    assert_transient_available('tenant-selfsteal-watchdog.service')
+    unit = scoped_unit(identifier, 'watchdog') if identifier else 'tenant-selfsteal-watchdog'
+    assert_transient_available(unit + '.timer')
+    assert_transient_available(unit + '.service')
+    if identifier:
+        record = operation_record(identifier)
+        record['resources'] = sorted(set(record.get('resources', [])) | {'watchdog'})
+        atomic_json(STATE / 'operation.json', record)
     # Persist intent BEFORE adding the rule. Boot + watchdog recover after SIGKILL.
     atomic_json(STATE / 'firewall.json', {'tag': tag, 'mode': 'ufw',
-                                        'port': config['challenge_port']})
+                                        'port': config['challenge_port'], **({'operation_id': identifier,
+                                        'install_id': config['install_id']} if identifier else {})})
     hook = [sys.executable, INSTALL / 'selfsteal.py', '_abort']
-    run(['systemd-run', '--unit=tenant-selfsteal-watchdog', '--on-active=25m',
-         '--description=Transitclient firewall watchdog', '--timer-property=Description=Transitclient firewall watchdog',
+    if identifier:
+        hook.extend(['--operation-id', identifier])
+    description = ('Transitclient watchdog ' + config['install_id'] + ' ' + identifier) if identifier else 'Transitclient firewall watchdog'
+    run(['systemd-run', '--unit=' + unit, '--on-active=17m',
+         '--description=' + description, '--timer-property=Description=' + description,
          '--timer-property=AccuracySec=1s', '--collect', *hook])
     run(['ufw', 'prepend', 'allow', f"{config['challenge_port']}/tcp", 'comment', tag])
     # prepend skips duplicates without updating their comments. Ordinary allow
@@ -602,9 +766,15 @@ def recover_update():
             os.replace(INSTALL, failed)
         os.replace(backup, INSTALL)
     PACKAGE = INSTALL
-    for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py'):
+    for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'recovery-current.json', 'schedule-pending.json'):
         if (snapshot / name).exists():
             shutil.copy2(snapshot / name, STATE / name)
+        elif name in ('recovery-current.json', 'schedule-pending.json'):
+            (STATE / name).unlink(missing_ok=True)
+    if (snapshot / 'config.json').exists():
+        atomic_json(CONFIG, read_json(snapshot / 'config.json'))
+    if (snapshot / 'units.json').exists():
+        restore_units(read_json(snapshot / 'units.json'))
     if (STATE / 'certs/current').exists():
         compose('up', '-d', '--no-build', 'caddy')
         reload_caddy()
@@ -613,11 +783,16 @@ def recover_update():
     journal.unlink()
 
 
-def abort_acme():
+def abort_acme(identifier=None):
     # Stop only our managed transient cgroup, including its socat listeners.
     # _cleanup is a hook and must not stop the ACME process invoking it.
-    stop_owned_transient('tenant-selfsteal-acme.service', 'Transitclient ACME')
-    cleanup_firewall()
+    identifier = identifier or _operation_id
+    if identifier:
+        stop_scoped_transient(identifier, 'acme')
+        cleanup_firewall(identifier)
+    elif not (STATE / 'operation.json').exists():
+        stop_owned_transient('tenant-selfsteal-acme.service', 'Transitclient ACME')
+        cleanup_firewall()
 
 
 def transient_state(unit):
@@ -885,12 +1060,13 @@ def recover_configuration():
     journal.unlink()
 
 
-def configure(config, choice=None):
+def configure(config, choice=None, firewall_request=None):
     if choice is None:
         print('⚙️ Настройки: 1 HTTP-порт для сертификата · 2 Порт для проксирования трафика · '
-              '3 Локальный HTTPS-порт веб-сервера · 4 Docker-сеть · 0 назад')
+              '3 Локальный HTTPS-порт веб-сервера · 4 Docker-сеть · 5 Firewall · 0 назад')
         choice = input('Выберите настройку: ').strip()
     candidate = dict(config)
+    firewall_plan = None
     if choice == '0':
         return config
     if choice == '1':
@@ -919,11 +1095,23 @@ def configure(config, choice=None):
         validate_network(candidate)
         if not candidate['docker_network'] and not free_port(candidate['local_port'], '127.0.0.1'):
             raise Failure('HTTPS-порт host занят. Измените его перед переключением.', 'HTTPS_PORT_BUSY')
+    elif choice == '5':
+        candidate['firewall'] = firewall_request or ask('Firewall: auto, ufw, preserve', config['firewall'])
+        candidate.pop('firewall_effective', None)
+        validate_config(candidate)
+        firewall = firewall_module()
+        try:
+            firewall_plan = firewall.plan(candidate, diagnostic_module().collect(candidate), run)
+        except firewall.FirewallError as exc:
+            raise Failure(str(exc), exc.code) from exc
+        candidate['firewall_effective'] = firewall_plan['effective']
+        for change in firewall_plan['changes']:
+            print('🛡️ ' + change)
     else:
         raise Failure('Неизвестная настройка.', 'INVALID_OPTION')
     labels = {'challenge_port': 'HTTP-порт для сертификата', 'vpn_port': 'Порт для проксирования трафика',
               'local_port': 'Локальный HTTPS-порт веб-сервера', 'docker_network': 'Docker-сеть',
-              'vpn_container': 'Контейнер ноды'}
+              'vpn_container': 'Контейнер ноды', 'firewall': 'Режим firewall', 'firewall_effective': 'Выбранная политика'}
     for key, label in labels.items():
         if config.get(key) != candidate.get(key):
             print(f"{label}: {config.get(key) or 'не задано'} → {candidate.get(key) or 'не задано'}")
@@ -931,8 +1119,28 @@ def configure(config, choice=None):
           f"HTTP: {candidate['challenge_port']}; target: {target(candidate)}.")
     if not confirm('Маршрут в боте согласован, применить только эти изменения?'):
         raise Failure('Настройки не изменены.', 'CANCELLED')
+    if choice == '5':
+        cleanup_firewall()
+        if firewall_plan['mode'] in ('inactive', 'missing'):
+            run(['systemctl', 'stop', 'tenant-selfsteal-renew.timer'])
+            atomic_json(STATE / 'schedule-pending.json', {'install_id': config.get('install_id', '')})
+        atomic_json(CONFIG, candidate)
+        try:
+            applied = firewall.apply(firewall_plan, candidate, STATE, run, atomic_json)
+        except firewall.FirewallError as exc:
+            lifecycle_stage('recovery_required', reason=exc.code)
+            raise Failure(str(exc), exc.code) from exc
+        if applied.get('status') == 'awaiting-confirmation':
+            lifecycle_stage('awaiting_firewall')
+            print('Подключитесь по SSH заново и выполните в течение 180 секунд:')
+            print('sudo transitclient firewall-confirm --confirmation-token ' + applied['token'])
+        return candidate
     if choice in ('1', '2'):
         atomic_json(CONFIG, candidate)
+        if choice == '1':
+            (STATE / 'http-path.json').unlink(missing_ok=True)
+            if (STATE / 'lifecycle.json').exists() and not (STATE / 'certs/current').exists():
+                lifecycle_stage('awaiting_http', reason='HTTP_ROUTE_CHANGED')
     else:
         snapshot = {'config': config}
         for name in ('Caddyfile', 'compose.yaml'):
@@ -956,9 +1164,25 @@ def configure(config, choice=None):
 
 
 def renew(config):
+    with operation_scope(config, 'renew'):
+        return _renew(config)
+
+
+def _renew(config):
     print('🔐 Проверяем срок сертификата и расписание продления.')
     print('Если продление ещё не требуется, новый сертификат не запрашивается; '
           'если требуется — выполняется выпуск и применение в Caddy.')
+    lifecycle = read_json(STATE / 'lifecycle.json') if (STATE / 'lifecycle.json').exists() else {}
+    if lifecycle.get('stage') in ('preparing', 'awaiting_firewall', 'uninstalling', 'recovery_required'):
+        raise Failure('Подготовка установки ещё не завершена. Повторите install или _recover.', 'RUNTIME_NOT_READY')
+    if lifecycle.get('stage') == 'awaiting_http':
+        raise Failure('Сначала подтвердите HTTP-путь: transitclient self-test --http01.', 'HTTP_PATH_UNCONFIRMED')
+    if lifecycle and not lifecycle.get('issuance_authorized'):
+        raise Failure('Выпуск/продление для восстановленной установки ещё не разрешены.', 'ACME_NOT_AUTHORIZED')
+    if not lifecycle:
+        # Upgrades preserve the issuance consent of existing installations.
+        lifecycle_stage('ready' if (STATE / 'certs/current').exists() else 'certificate_pending',
+                        issuance_authorized=True)
     check_dns(config)
     home = STATE / 'acme'
     home.mkdir(exist_ok=True, mode=0o700)
@@ -968,8 +1192,12 @@ def renew(config):
         account.write_text("AUTO_UPGRADE='0'\n", encoding='utf-8')
         account.chmod(0o600)
     domain_dir = home / (config['domain'] + '_ecc')
-    pre = shlex.join([sys.executable, str(INSTALL / 'selfsteal.py'), '_open'])
-    post = shlex.join([sys.executable, str(INSTALL / 'selfsteal.py'), '_cleanup'])
+    identifier = _operation_id
+    record = operation_record(identifier)
+    if not (STATE / 'certs/current').exists():
+        lifecycle_stage('certificate_pending')
+    pre = shlex.join([sys.executable, str(INSTALL / 'selfsteal.py'), '_open', '--operation-id', identifier])
+    post = shlex.join([sys.executable, str(INSTALL / 'selfsteal.py'), '_cleanup', '--operation-id', identifier])
     synchronize_acme_parameters(config, pre, post)
     if (domain_dir / (config['domain'] + '.conf')).exists():
         args = ['--renew', '-d', config['domain'], '--ecc',
@@ -982,12 +1210,14 @@ def renew(config):
         # The transient service owns the standalone listener and survives loss of
         # the interactive parent only up to its strict deadline. ExecStopPost,
         # watchdog and boot recovery close tagged rules after SIGKILL too.
-        assert_transient_available('tenant-selfsteal-acme.service')
-        result = run(['systemd-run', '--unit=tenant-selfsteal-acme', '--description=Transitclient ACME', '--wait', '--pipe',
+        unit = scoped_unit(identifier, 'acme')
+        assert_transient_available(unit + '.service')
+        claim_resource(identifier, 'acme')
+        result = run(['systemd-run', '--unit=' + unit, '--description=Transitclient acme ' + record['install_id'] + ' ' + identifier, '--wait', '--pipe',
                       '--collect', '--service-type=exec',
                       '--property=RuntimeMaxSec=15min', '--property=KillMode=control-group',
                       '--property=UMask=0077', '--setenv=LC_ALL=C',
-                      '--property=ExecStopPost=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py _cleanup',
+                      '--property=ExecStopPost=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py _cleanup --operation-id ' + identifier,
                       *acme_command(config, *args)], check=False, timeout=ACME_TIMEOUT + 60)
         # acme.sh's documented RENEW_SKIP=2 is not a CA error. It runs the
         # pre-hook AFTER its due/ARI checks, so skipped runs never open firewall.
@@ -1012,19 +1242,105 @@ def renew(config):
         label = 'STAGING: тестовая цепочка, НЕ публичное доверие' if config['ca'] == STAGING else "Let's Encrypt: доверенная цепочка"
         print(f"{label}; Caddy проверен с SNI {config['domain']} на {target(config)}.")
         print('✅ Проверка продления завершена.')
+        lifecycle_stage('ready')
     finally:
         abort_acme()
 
 
+def install_recovery():
+    """Publish one complete generation before swapping a root-only pointer."""
+    generation = uuid.uuid4().hex
+    root = STATE / 'recovery' / generation
+    root.mkdir(parents=True, mode=0o700)
+    for source in PACKAGE.glob('*.py'):
+        shutil.copyfile(source, root / source.name)
+        (root / source.name).chmod(0o600)
+    for name in ('dependencies.json', 'templates.json', 'VERSION'):
+        shutil.copyfile(PACKAGE / name, root / name)
+        (root / name).chmod(0o600)
+    pointer = dict(generation=generation, install_id=read_json(CONFIG).get('install_id') if CONFIG.exists() else None)
+    # The wrapper never imports modules from a partly replaced INSTALL directory.
+    wrapper = '''#!/usr/bin/env python3
+import json
+from pathlib import Path
+import re
+import runpy
+import sys
+state = Path(__file__).resolve().parent
+record = json.loads((state / 'recovery-current.json').read_text())
+if not re.fullmatch(r'[0-9a-f]{32}', record['generation']):
+    raise SystemExit('Invalid recovery generation')
+root = state / 'recovery' / record['generation']
+sys.path.insert(0, str(root))
+runpy.run_path(str(root / 'selfsteal.py'), run_name='__main__')
+'''
+    candidate = STATE / 'recover.py.next'
+    candidate.write_text(wrapper, encoding='utf-8')
+    candidate.chmod(0o600)
+    # On first install no recovery unit exists yet. On update an existing wrapper
+    # continues using its old complete generation until this atomic pointer swap.
+    atomic_json(STATE / 'recovery-current.json', pointer)
+    os.replace(candidate, STATE / 'recover.py')
+
+
+def snapshot_units():
+    values = {}
+    for name in ('renew.service', 'renew.timer', 'recover.service'):
+        unit = 'tenant-selfsteal-' + name
+        path = UNITS / unit
+        result = run(['systemctl', 'show', unit, '-p', 'UnitFileState', '-p', 'ActiveState'], check=False)
+        props = dict(line.split('=', 1) for line in result.stdout.decode().splitlines() if '=' in line)
+        if path.exists() and (result.returncode or not props.get('UnitFileState') or not props.get('ActiveState')):
+            raise Failure('Не удалось сохранить состояние собственного unit: ' + unit, 'SYSTEMD_STATE_UNKNOWN')
+        values[name] = dict(content=path.read_text() if path.exists() else None,
+                            enabled=props.get('UnitFileState') == 'enabled',
+                            active=props.get('ActiveState') == 'active')
+    return values
+
+
+def restore_units(values):
+    # All names were proved owned by the caller before rollback. Stop before
+    # rewriting; otherwise a newly enabled timer can survive a missing old file.
+    for name in values:
+        if name not in ('renew.service', 'renew.timer', 'recover.service'):
+            raise Failure('Неизвестный unit в резервной копии.', 'RECOVERY_INVALID')
+        if (UNITS / ('tenant-selfsteal-' + name)).exists():
+            run(['systemctl', 'disable', '--now', 'tenant-selfsteal-' + name])
+    for name, item in values.items():
+        if name not in ('renew.service', 'renew.timer', 'recover.service'):
+            raise Failure('Неизвестный unit в резервной копии.', 'RECOVERY_INVALID')
+        path = UNITS / ('tenant-selfsteal-' + name)
+        if item['content'] is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(item['content'], encoding='utf-8')
+    run(['systemctl', 'daemon-reload'])
+    for name, item in values.items():
+        if item['content'] is None:
+            continue
+        unit = 'tenant-selfsteal-' + name
+        run(['systemctl', 'enable' if item['enabled'] else 'disable', unit])
+        # Do not resurrect an ACME worker from a stale active service snapshot.
+        if name != 'renew.service' and not item['active']:
+            run(['systemctl', 'stop', unit])
+    atomic_json(STATE / 'units-restore-pending.json', values)
+
+
+def activate_restored_units():
+    path = STATE / 'units-restore-pending.json'
+    if not path.exists() or not CONFIG.exists():
+        return
+    values = read_json(path)
+    check_install_resources()
+    for name in ('recover.service', 'renew.timer'):
+        item = values.get(name, {})
+        if item.get('content') is not None and item.get('active'):
+            run(['systemctl', 'start', 'tenant-selfsteal-' + name])
+    path.unlink()
+
+
 def install_units():
-    # Independent stable helper survives a killed package-directory replacement.
-    recovery = STATE / 'recover.py.next'
-    shutil.copyfile(PACKAGE / 'selfsteal.py', recovery)
-    recovery.chmod(0o600)
-    os.replace(recovery, STATE / 'recover.py')
-    shutil.copyfile(PACKAGE / 'diagnostics.py', STATE / 'diagnostics.py')
-    shutil.copyfile(PACKAGE / 'site_templates.py', STATE / 'site_templates.py')
-    shutil.copyfile(PACKAGE / 'firewall_setup.py', STATE / 'firewall_setup.py')
+    install_recovery()
     service = '''[Unit]
 Description=Tenant selfsteal HTTP-01 renewal
 After=network-online.target docker.service tenant-selfsteal-recover.service
@@ -1035,13 +1351,13 @@ StartLimitIntervalSec=0
 Type=oneshot
 UMask=0077
 Environment=LC_ALL=C
-ExecStart=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py renew
-ExecStopPost=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py _abort
+ExecStart=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py renew --worker
 TimeoutStartSec=20min
 TimeoutStopSec=60s
 KillMode=control-group
 Restart=on-failure
 RestartSec=1h
+RestartPreventExitStatus=75
 '''
     timer = '''[Unit]
 Description=Check tenant selfsteal renewal regularly (acme.sh ARI policy)
@@ -1072,13 +1388,42 @@ WantedBy=multi-user.target
         (UNITS / ('tenant-selfsteal-' + name)).write_text(content, encoding='utf-8')
     run(['systemctl', 'daemon-reload'])
     run(['systemctl', 'enable', 'tenant-selfsteal-recover.service'])
+    # Activation is deferred until the caller releases its lifecycle lock.
+    atomic_json(STATE / 'schedule-pending.json', {'install_id': identifier})
+
+
+def activate_schedule():
+    from renewal_schedule import PROPERTIES, fields, health
+    pending = STATE / 'schedule-pending.json'
+    activate_restored_units()
+    if not pending.exists():
+        return
+    stage = read_json(STATE / 'lifecycle.json').get('stage') if (STATE / 'lifecycle.json').exists() else None
+    if stage in ('preparing', 'awaiting_firewall', 'uninstalling', 'recovery_required'):
+        return
+    config = read_json(CONFIG)
+    if read_json(pending).get('install_id') != config.get('install_id', ''):
+        raise Failure('Владелец расписания не подтверждён.', 'OWNERSHIP_UNKNOWN')
+    if any((STATE / name).exists() for name in ('update-transaction.json', 'configuration-transaction.json', 'uninstall.json')):
+        return
     run(['systemctl', 'enable', '--now', 'tenant-selfsteal-renew.timer'])
     run(['systemctl', 'is-enabled', '--quiet', 'tenant-selfsteal-renew.timer'])
     run(['systemctl', 'is-active', '--quiet', 'tenant-selfsteal-renew.timer'])
-    next_run = run(['systemctl', 'show', 'tenant-selfsteal-renew.timer',
-                    '-p', 'NextElapseUSecRealtime', '--value']).stdout.decode().strip()
-    if not next_run or next_run in ('0', 'n/a'):
-        raise Failure('Timer включён, но следующий запуск не назначен. Проверьте systemd timer.')
+    deadline = time.monotonic() + 10
+    while True:
+        timer = fields(run(['systemctl', 'show', 'tenant-selfsteal-renew.timer',
+                            *[part for prop in PROPERTIES for part in ('-p', prop)]]).stdout.decode())
+        service = fields(run(['systemctl', 'show', 'tenant-selfsteal-renew.service',
+                              '-p', 'ActiveState', '-p', 'Result']).stdout.decode())
+        state = health(timer, service)
+        if state in ('running', 'waiting', 'service_failed'):
+            pending.unlink(missing_ok=True)
+            if state == 'service_failed':
+                print('⚠️ Расписание включено; последняя проверка продления завершилась ошибкой. Используйте diagnose.')
+            return
+        if time.monotonic() >= deadline:
+            raise Failure('Состояние расписания не подтверждено. Проверьте systemd timer.', 'RENEW_TIMER_UNKNOWN')
+        time.sleep(0.2)
 
 
 def ask(label, default=''):
@@ -1095,7 +1440,7 @@ def interactive_config(args):
               'local_port': ask('Локальный HTTPS-порт веб-сервера', getattr(args, 'local_port', None) or 9443),
               'docker_network': getattr(args, 'docker_network', None) or '',
               'vpn_container': getattr(args, 'vpn_container', None) or '',
-              'firewall': getattr(args, 'firewall', None) or 'ufw',
+              'firewall': getattr(args, 'firewall', None) or 'auto',
               'ca': STAGING if args.staging_ca_file else PRODUCTION,
               'staging_ca_file': str(Path(args.staging_ca_file).resolve()) if args.staging_ca_file else None,
               'package_url': '', 'package_version': '', 'package_sha256': '',
@@ -1152,6 +1497,8 @@ def detect_vpn_network(config, report):
 
 
 def check_install_resources():
+    if CONFIG.with_name('uninstall-transaction.json').exists():
+        raise Failure('Удаление прервано. Завершите его через transitclient _recover.', 'UNINSTALL_RECOVERY_REQUIRED')
     if CONFIG.is_symlink() or INSTALL.is_symlink() or STATE.is_symlink():
         raise Failure('Пути установки заняты символическими ссылками.', 'OWNERSHIP_CONFLICT')
     if not CONFIG.exists() and ((INSTALL.exists() and not package_owned()) or (STATE.exists() and any(STATE.iterdir()))):
@@ -1196,7 +1543,10 @@ def copy_package(source, destination):
         if (source / directory).is_symlink():
             raise Failure('Каталог пакета содержит символическую ссылку.', 'PACKAGE_UNSAFE')
         files.extend(path for path in (source / directory).rglob('*') if path.is_file()
-                     and '__pycache__' not in path.parts and path.suffix != '.pyc')
+                     and '__pycache__' not in path.parts and path.suffix != '.pyc'
+                     and path.name.casefold() != 'agents.md'
+                     and (directory != 'docs' or path.relative_to(source / 'docs').as_posix()
+                          in ('implementation.md', 'integration.md', 'operations.md', 'publication.md')))
     for path in files:
         if not path.is_file() or any(parent.is_symlink() for parent in (path, *path.parents)
                                     if parent.is_relative_to(source)):
@@ -1221,6 +1571,7 @@ def installation_plan(config):
     if missing:
         print('  Установить пакеты: ' + ', '.join(missing))
     print('  Сертификат: ' + ('тестовый' if config['ca'] == STAGING else "Let's Encrypt") + '; автоматическое продление.')
+    print('  Сначала HTTP-проверка до двух минут без CA; первый выпуск только после её успеха.')
     print('  Команда управления: transitclient. Нода и существующие сайты сохраняются.')
     return confirm('Установить?')
 
@@ -1257,6 +1608,9 @@ def install(args):
             raise Failure('Незавершённая настройка UFW. Выполните sudo transitclient _recover, '
                           'затем повторите установку.', 'FIREWALL_RECOVERY_REQUIRED')
         config = validate_config(read_json(CONFIG))
+        if getattr(args, 'firewall', None) and args.firewall != config['firewall']:
+            raise Failure('Для смены firewall используйте transitclient configure --firewall ' + args.firewall +
+                          ' и пункт 5. Сохранённая политика не изменена.', 'FIREWALL_CHANGE_REQUIRED')
         print('Сохранены прежние настройки, ACME account и сертификат.')
         if INSTALL.exists() and PACKAGE != INSTALL:
             if not package_owned() or (INSTALL / 'VERSION').read_text().strip() != (PACKAGE / 'VERSION').read_text().strip():
@@ -1305,6 +1659,7 @@ def install(args):
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     STATE.chmod(0o700)
     config.setdefault('install_id', uuid.uuid4().hex)
+    config['firewall_effective'] = firewall_plan.get('effective', 'preserve' if config['firewall'] == 'manual' else config['firewall'])
     if not CONFIG.exists():
         if config['ca'] == STAGING:
             trust = STATE / 'staging-trust.pem'
@@ -1323,6 +1678,7 @@ def install(args):
                                   for name in ('renew.service', 'renew.timer', 'recover.service')
                                   if (UNITS / ('tenant-selfsteal-' + name)).exists()}})
         atomic_json(CONFIG, config)
+    lifecycle_stage('preparing', issuance_authorized=True)
     package_transaction = False
     try:
         dependencies()
@@ -1344,13 +1700,13 @@ def install(args):
                                       'sudo python3 /var/lib/tenant-selfsteal/recover.py _recover.', 'UPDATE_RECOVERY_REQUIRED')
                     snapshot.mkdir(mode=0o700)
                     helpers = ('recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py')
-                    for name in ('Caddyfile', 'compose.yaml', 'docker-compose', *helpers):
+                    for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recovery-current.json', 'schedule-pending.json', *helpers):
                         if (STATE / name).exists():
                             shutil.copy2(STATE / name, snapshot / name)
+                    atomic_json(snapshot / 'units.json', snapshot_units())
+                    atomic_json(snapshot / 'config.json', read_json(CONFIG))
                     # Stable recovery must exist before a possible rename gap.
-                    for name in helpers:
-                        shutil.copyfile(PACKAGE / ('selfsteal.py' if name == 'recover.py' else name), STATE / name)
-                        (STATE / name).chmod(0o600)
+                    install_recovery()
                     atomic_json(STATE / 'update-transaction.json', {'id': identifier})
                     package_transaction = True
                     os.replace(INSTALL, backup)
@@ -1368,7 +1724,7 @@ def install(args):
             (STATE / 'update-transaction.json').unlink()
             package_transaction = False
         try:
-            firewall.apply(firewall_plan, config, STATE, run, atomic_json)
+            firewall_result = firewall.apply(firewall_plan, config, STATE, run, atomic_json)
         except firewall.FirewallError as exc:
             raise Failure(str(exc), exc.code) from exc
         if chosen_template is not None:
@@ -1380,6 +1736,20 @@ def install(args):
             reload_caddy()
             verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem'))
         (STATE / 'configuration-transaction.json').unlink(missing_ok=True)
+        lifecycle_stage('runtime_ready')
+        if firewall_result and firewall_result.get('status') == 'awaiting-confirmation':
+            lifecycle_stage('awaiting_firewall')
+            print('Откройте НОВОЕ SSH-соединение и в течение 180 секунд выполните:')
+            print('sudo transitclient firewall-confirm --confirmation-token ' + firewall_result['token'])
+            return
+        if not (STATE / 'certs/current').exists():
+            try:
+                http_self_test(config, approved=True)
+            except Failure as exc:
+                lifecycle_stage('awaiting_http', reason=exc.code)
+                print('⚠️ Пакет подготовлен. HTTP-путь пока не подтверждён; запрос в CA не отправлен.')
+                print('После исправления маршрута: sudo transitclient self-test --http01, затем sudo transitclient renew.')
+                return
         renew(config)
         print('Теперь настройте VPN-ноду и нажмите в боте «Готово, проверить backend».')
     except BaseException:
@@ -1427,8 +1797,18 @@ def saved_status(config):
                               'target': target(config) if config else None,
                               'caddy_image': dependency_lock()['caddy']['image'],
                               'certificate': certificate_status(config)}
+    if (STATE / 'lifecycle.json').exists():
+        report['installation']['lifecycle'] = read_json(STATE / 'lifecycle.json')
+    if config:
+        report['installation']['firewall_requested'] = config['firewall']
+        report['installation']['firewall_effective'] = config.get('firewall_effective', config['firewall'])
     report['pending'] = [name for name in ('firewall.json', 'ufw-activation.json', 'certificate-transaction.json',
-                         'configuration-transaction.json', 'update-transaction.json', 'site-transaction.json') if (STATE / name).exists()]
+                         'configuration-transaction.json', 'update-transaction.json', 'site-transaction.json',
+                         'operation.json', 'uninstall.json', 'schedule-pending.json') if (STATE / name).exists()]
+    if CONFIG.with_name('uninstall-transaction.json').exists():
+        report['pending'].append('uninstall-transaction.json')
+        report['checks'].append(dict(code='UNINSTALL_RECOVERY_REQUIRED', status='unknown',
+                                    message='Удаление прервано после остановки ресурсов. Выполните transitclient _recover.'))
     preparation = STATE / 'ufw-package-preparation.json'
     if preparation.exists():
         try:
@@ -1489,16 +1869,18 @@ def diagnose(config, json_output=False, interactive=False, full=False, no_color=
     for unit in ('tenant-selfsteal-renew.timer', 'tenant-selfsteal-renew.service'):
         try:
             result = run(['systemctl', 'show', unit, '-p', 'ActiveState', '-p', 'Result',
-                          '-p', 'UnitFileState', '-p', 'NextElapseUSecRealtime',
+                          '-p', 'UnitFileState', '-p', 'SubState', '-p', 'Job', '-p', 'NextElapseUSecRealtime',
                           '-p', 'ExecMainStartTimestamp', '-p', 'ExecMainExitTimestamp'], check=False)
             report['units'][unit] = dict(line.split('=', 1) for line in result.stdout.decode().splitlines() if '=' in line)
         except (OSError, subprocess.SubprocessError):
             report['units'][unit] = {'error': 'SYSTEMD_UNAVAILABLE'}
     timer = report['units']['tenant-selfsteal-renew.timer']
-    if config and (timer.get('ActiveState') != 'active' or timer.get('UnitFileState') != 'enabled'
-                   or timer.get('NextElapseUSecRealtime', '') in ('', '0', 'n/a')):
+    from renewal_schedule import health
+    schedule = health(timer, report['units']['tenant-selfsteal-renew.service'])
+    report['renewal_schedule'] = schedule
+    if config and schedule not in ('waiting', 'running'):
         report['checks'].append({'code': 'RENEW_TIMER_INACTIVE', 'status': 'error',
-                                 'message': 'Автоматическое продление не подтверждено: таймер выключен либо следующий запуск неизвестен.'})
+                                 'message': 'Продление требует проверки: ' + schedule + '.'})
     verified_identity = None
     if config and (STATE / 'certificate-transaction.json').exists():
         report['checks'].append({'code': 'CERT_SWITCH_PENDING', 'status': 'unknown',
@@ -1585,28 +1967,47 @@ def probe_server(config, token):
 
 
 def stop_probe():
-    stop_owned_transient('tenant-selfsteal-probe.service', 'Transitclient HTTP probe')
+    if _operation_id:
+        stop_scoped_transient(_operation_id, 'probe')
+    else:
+        stop_owned_transient('tenant-selfsteal-probe.service', 'Transitclient HTTP probe')
     cleanup_firewall()
 
 
-def http_self_test(config):
+def http_self_test(config, *, approved=False, external_check=False):
+    if not approved:
+        check_dns(config)
+        check_challenge_port(config)
+        if not confirm('Запустить HTTP self-test на срок до двух минут?'):
+            raise Failure('Сетевой тест отменён.', 'CANCELLED')
+    with operation_scope(config, 'http_probe'):
+        return _http_self_test(config, approved=True, external_check=external_check)
+
+
+def _http_self_test(config, *, approved=False, external_check=False):
     check_dns(config)
     check_challenge_port(config)
     print(f"🔍 Временный HTTP self-test: домен:80 релея → backend:{config['challenge_port']}.")
     print('Это сетевой тест из текущей точки, без CA и выпуска сертификата. Firewall/слушатель будут временными.')
-    if not confirm('Запустить HTTP self-test на срок до двух минут?'):
+    if not approved and not confirm('Запустить HTTP self-test на срок до двух минут?'):
         raise Failure('Сетевой тест отменён.', 'CANCELLED')
     token = uuid.uuid4().hex  # A disposable public diagnostic nonce, never an ACME response.
     address = f"http://{config['domain']}/.well-known/acme-challenge/{token}"
     print('Для независимой проверки во время теста: curl --fail --noproxy "*" ' + shlex.quote(address))
     created = False
+    scope = 'backend'
+    started = time.monotonic()
     try:
-        assert_transient_available('tenant-selfsteal-probe.service')
+        identifier = _operation_id
+        record = operation_record(identifier)
+        unit = scoped_unit(identifier, 'probe')
+        assert_transient_available(unit + '.service')
         open_firewall(config)
-        run(['systemd-run', '--unit=tenant-selfsteal-probe', '--description=Transitclient HTTP probe', '--collect', '--service-type=exec',
+        claim_resource(identifier, 'probe')
+        run(['systemd-run', '--unit=' + unit, '--description=Transitclient probe ' + record['install_id'] + ' ' + identifier, '--collect', '--service-type=exec',
              '--property=RuntimeMaxSec=120s', '--property=KillMode=control-group',
-             '--property=ExecStopPost=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py _cleanup',
-             '/usr/bin/python3', INSTALL / 'selfsteal.py', '_probe-server', '--probe-token', token])
+             '--property=ExecStopPost=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py _cleanup --operation-id ' + identifier,
+             '/usr/bin/python3', INSTALL / 'selfsteal.py', '_probe-server', '--operation-id', identifier, '--probe-token', token])
         created = True
         response = None
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -1618,9 +2019,26 @@ def http_self_test(config):
             except OSError:
                 time.sleep(1)
         if response != ('transitclient-check:' + token).encode():
-            raise Failure('HTTP-путь не подтверждён из этой точки. Проверьте готовность маршрута в боте, '
-                          'NAT/firewall; при NAT hairpin повторите проверку с внешней машины.', 'HTTP_PATH_UNCONFIRMED')
-        print('✅ HTTP-путь подтверждён из текущей точки. Доступность со всех точек CA этим не доказана.')
+            if not external_check:
+                raise Failure('HTTP-путь не подтверждён из этой точки. Проверьте готовность маршрута в боте, '
+                              'NAT/firewall; при NAT hairpin повторите self-test --http01 --external-check '
+                              'с независимой внешней машиной.', 'HTTP_PATH_UNCONFIRMED')
+            print('Локальная проверка не подтвердилась. Пока работает слушатель, проверьте показанный URL с внешней машины.')
+            print('Требуется точный ответ: transitclient-check:' + token)
+            if not confirm('Внешняя машина получила HTTP200 и точный контрольный ответ для этого URL?') or time.monotonic() - started >= 120:
+                raise Failure('Внешняя проверка не подтверждена либо её срок истёк.', 'HTTP_PATH_UNCONFIRMED')
+            scope = 'operator_reported'
+            print('⚠️ Внешний HTTP-путь подтверждён по вашему сообщению; установщик не проверял внешнюю машину.')
+        else:
+            print('✅ HTTP-путь подтверждён из текущей точки. Доступность со всех точек CA этим не доказана.')
+        fingerprint = hashlib.sha256(json.dumps({key: config.get(key) for key in
+                        ('domain', 'relay_ip', 'challenge_port')}, sort_keys=True).encode()).hexdigest()
+        atomic_json(STATE / 'http-path.json', dict(status='confirmed', scope=scope, at=int(time.time()),
+                    install_id=config['install_id'], fingerprint=fingerprint))
+        if (STATE / 'lifecycle.json').exists():
+            lifecycle = read_json(STATE / 'lifecycle.json')
+            if lifecycle.get('stage') in ('runtime_ready', 'awaiting_http', 'certificate_pending'):
+                lifecycle_stage('certificate_pending')
     finally:
         # Only stop a listener after this invocation has successfully created it.
         if created:
@@ -1705,7 +2123,8 @@ def update(config, args):
                         or any(part in ('', '.', '..') or ':' in part for part in member.name.split('/'))):
                     raise Failure('Небезопасный путь/тип в архиве обновления.')
                 names.add(member.name)
-            tar.extractall(extracted, members=members)
+            tar.extractall(extracted, members=members,
+                           **({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))
         if (extracted / 'VERSION').read_text().strip() != version:
             raise Failure('Версия артефакта не совпадает с выбранной.')
         for name in ('selfsteal.py', 'selfsteal.sh', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'templates.json', 'vendor/acme.sh', 'dependencies.json', 'docs/integration.md'):
@@ -1730,14 +2149,16 @@ def update(config, args):
         shutil.copytree(extracted, candidate)
         snapshot = STATE / ('update-backup-' + identifier)
         snapshot.mkdir(mode=0o700)
-        for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py'):
+        for name in ('Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py', 'site_templates.py', 'firewall_setup.py', 'recovery-current.json', 'schedule-pending.json'):
             if (STATE / name).exists():
                 shutil.copy2(STATE / name, snapshot / name)
-        atomic_json(STATE / 'update-transaction.json', {'id': identifier})
+        atomic_json(snapshot / 'units.json', snapshot_units())
+        atomic_json(snapshot / 'config.json', read_json(CONFIG))
+        atomic_json(STATE / 'update-transaction.json', {'id': identifier, 'parent_pid': os.getpid()})
         os.replace(INSTALL, backup)
         os.replace(candidate, INSTALL)
         try:
-            run([sys.executable, INSTALL / 'selfsteal.py', '_update-apply'], timeout=600)
+            run([sys.executable, INSTALL / 'selfsteal.py', '_update-apply', '--operation-id', identifier], timeout=600)
         except BaseException:
             recover_update()
             raise
@@ -1756,29 +2177,292 @@ def uninstall():
         raise Failure('Удаление отменено.', 'CANCELLED')
     check_install_resources()
     assert_compose_owned()
+    config = read_json(CONFIG)
+    if not config.get('install_id'):
+        config['install_id'] = read_json(INSTALL / '.transitclient-package.json')['install_id'] if package_owned() else uuid.uuid4().hex
+        atomic_json(CONFIG, config)
+    backup = STATE.with_name('tenant-selfsteal-backup-' + time.strftime('%Y%m%d%H%M%S') + '-' + uuid.uuid4().hex)
+    if backup.exists():
+        raise Failure('Имя резервной копии уже занято.', 'BACKUP_CONFLICT')
+    atomic_json(STATE / 'uninstall.json', {'install_id': read_json(CONFIG).get('install_id')})
+    lifecycle_stage('uninstalling')
     run(['systemctl', 'disable', '--now', 'tenant-selfsteal-renew.timer',
-         'tenant-selfsteal-recover.service'], check=False)
+         'tenant-selfsteal-recover.service'])
+    run(['systemctl', 'stop', 'tenant-selfsteal-renew.service'])
+    stop_retry()
+    recover_operation()
     # Lock proves no other renewal is executing; no killing third-party listeners.
     cleanup_firewall()
     compose('down')
+    # Persistent timer stamp is state, not a unit file. Clean while the stopped
+    # owned timer is still loaded; a fresh installation must not inherit it.
+    run(['systemctl', 'clean', '--what=state', 'tenant-selfsteal-renew.timer'])
     for name in ('renew.timer', 'renew.service', 'recover.service'):
         (UNITS / ('tenant-selfsteal-' + name)).unlink(missing_ok=True)
     run(['systemctl', 'daemon-reload'])
-    backup = STATE.with_name('tenant-selfsteal-backup-' + time.strftime('%Y%m%d%H%M%S'))
+    # This journal survives STATE's final rename. A kill between rename and
+    # CONFIG deletion must not leave an apparently configured empty install.
+    atomic_json(CONFIG.with_name('uninstall-transaction.json'), dict(
+                stage='resources_removed', install_id=config['install_id'], backup=str(backup)))
+    finish_uninstall(backup, config)
+
+
+def finish_uninstall(backup, config):
+    marker = CONFIG.with_name('uninstall-transaction.json')
+    transaction = read_json(marker)
+    if (transaction.get('stage') != 'resources_removed' or transaction.get('install_id') != config.get('install_id')
+            or transaction.get('backup') != str(backup) or backup.parent != STATE.parent
+            or not re.fullmatch(r'tenant-selfsteal-backup-[0-9]{14}-[0-9a-f]{32}', backup.name)
+            or backup.is_symlink() or STATE.is_symlink()):
+        raise Failure('Журнал удаления требует ручной сверки.', 'UNINSTALL_RECOVERY_REQUIRED')
     if backup.exists():
-        raise Failure('Имя резервной копии уже занято.', 'BACKUP_CONFLICT')
-    STATE.chmod(0o700)
-    shutil.copy2(CONFIG, STATE / 'config-backup.json')
-    os.replace(STATE, backup)
-    CONFIG.unlink()
+        if STATE.exists() or read_json(backup / 'backup-manifest.json').get('install_id') != config.get('install_id'):
+            raise Failure('Данные удаления неоднозначны; копия сохранена.', 'UNINSTALL_RECOVERY_REQUIRED')
+    else:
+        prepare_uninstall_backup(backup, config)
+    CONFIG.unlink(missing_ok=True)
     if LAUNCHER.exists() and not LAUNCHER.is_symlink() and LAUNCHER.read_text() == launcher_content():
         LAUNCHER.unlink()
-    # Keep recoverable ACME account/cert/key; never print those contents.
+    marker.unlink()
     print('Данные/сертификаты/ACME account сохранены с root-only доступом: ' + str(backup))
     print('Установленный исходный пакет сохранён в /opt/tenant-selfsteal; удалите вручную при необходимости.')
 
 
+def prepare_uninstall_backup(backup, config):
+    STATE.chmod(0o700)
+    shutil.copy2(CONFIG, STATE / 'config-backup.json')
+    atomic_json(STATE / 'backup-manifest.json', dict(kind='transitclient-backup', schema=1,
+                install_id=config['install_id'], domain=config['domain'],
+                config_sha256=hashlib.sha256((STATE / 'config-backup.json').read_bytes()).hexdigest()))
+    for item in STATE.rglob('*'):
+        if not item.is_symlink():
+            item.chmod(0o700 if item.is_dir() else 0o600)
+    os.replace(STATE, backup)
+
+
+def resume_uninstall():
+    marker = CONFIG.with_name('uninstall-transaction.json')
+    if not marker.exists():
+        return False
+    transaction = read_json(marker)
+    backup = Path(transaction.get('backup', ''))
+    if backup.parent != STATE.parent or not re.fullmatch(r'tenant-selfsteal-backup-[0-9]{14}-[0-9a-f]{32}', backup.name):
+        raise Failure('Путь резервной копии не подтверждён.', 'UNINSTALL_RECOVERY_REQUIRED')
+    config = read_json(CONFIG) if CONFIG.exists() else read_json(backup / 'config-backup.json')
+    finish_uninstall(backup, config)
+    return True
+
+
+def restore_backup(args):
+    """Restore only explicit local owner backups, using this trusted runtime."""
+    if not getattr(args, 'backup', None):
+        raise Failure('Укажите выбранную копию: restore --backup /var/lib/tenant-selfsteal-backup-…', 'BACKUP_REQUIRED')
+    source = Path(args.backup)
+    if source.is_symlink() or source.resolve().parent != STATE.parent.resolve() or not source.name.startswith('tenant-selfsteal-backup-'):
+        raise Failure('Ожидается собственная локальная резервная копия.', 'BACKUP_UNTRUSTED')
+    manifest_path, config_path = source / 'backup-manifest.json', source / 'config-backup.json'
+    if not manifest_path.is_file() or not config_path.is_file():
+        raise Failure('У копии нет подтверждённого manifest. Старая копия сохранена для ручной сверки.', 'BACKUP_UNTRUSTED')
+    for item in (source, *source.rglob('*')):
+        if item.is_symlink():
+            if item != source / 'certs/current' or not re.fullmatch(r'[0-9a-f]{32}', os.readlink(item)):
+                raise Failure('В резервной копии обнаружена неподтверждённая ссылка.', 'BACKUP_UNTRUSTED')
+            continue
+        if not item.is_file() and not item.is_dir():
+            raise Failure('В резервной копии обнаружен специальный файл.', 'BACKUP_UNTRUSTED')
+        if os.name == 'posix' and (item.stat().st_uid != 0 or item.stat().st_mode & 0o077):
+            raise Failure('Резервная копия должна быть доступна только root.', 'BACKUP_UNTRUSTED')
+    manifest = read_json(manifest_path)
+    config = validate_config(read_json(config_path))
+    if (manifest.get('kind') != 'transitclient-backup' or manifest.get('install_id') != config.get('install_id')
+            or not config.get('install_id') or manifest.get('domain') != config['domain']
+            or manifest.get('config_sha256') != hashlib.sha256(config_path.read_bytes()).hexdigest()):
+        raise Failure('Принадлежность резервной копии не подтверждена.', 'BACKUP_UNTRUSTED')
+    changed_domain = bool(getattr(args, 'domain', None) and domain_value(args.domain) != config['domain'])
+    if changed_domain:
+        config['domain'] = domain_value(args.domain)
+        config['relay_ip'] = getattr(args, 'relay_ip', None) or ''
+    if CONFIG.exists() or STATE.exists() and any(STATE.iterdir()):
+        raise Failure('Активные данные уже существуют. Восстановление поверх них запрещено.', 'RESTORE_CONFLICT')
+    check_install_resources()
+    check_dns(config)
+    check_challenge_port(config)
+    assert_local_docker()
+    if not confirm('Восстановить выбранную установку ' + config['domain'] + ' с прежней ACME identity?'):
+        raise Failure('Восстановление отменено.', 'CANCELLED')
+    # Never execute any helper/script or take dependency pins from the backup.
+    with tempfile.TemporaryDirectory(dir=STATE.parent, prefix='transitclient-restore-') as directory:
+        staged = Path(directory) / 'state'
+        staged.mkdir(mode=0o700)
+        for name in ('acme', 'certs', 'site', 'site-template.json', 'site-history.json', 'staging-trust.pem'):
+            item = source / name
+            if item.is_dir():
+                shutil.copytree(item, staged / name, symlinks=True)
+            elif item.is_file():
+                shutil.copy2(item, staged / name)
+        STATE.mkdir(mode=0o700, exist_ok=True)
+        STATE.rmdir()  # Known empty; rename publishes the complete staged state.
+        os.replace(staged, STATE)
+    if changed_domain:
+        current = STATE / 'certs/current'
+        if current.is_symlink():
+            current.unlink()
+        elif current.exists():
+            os.replace(current, current.with_name('restored-unselected-' + uuid.uuid4().hex))
+    if config['ca'] == STAGING:
+        config['staging_ca_file'] = str(STATE / 'staging-trust.pem')
+    atomic_json(CONFIG, config)
+    lifecycle_stage('preparing', issuance_authorized=False)
+    dependencies()
+    global PACKAGE
+    if PACKAGE != INSTALL:
+        identifier = uuid.uuid4().hex
+        staged = INSTALL.with_name('tenant-selfsteal.restore-' + identifier)
+        copy_package(PACKAGE, staged)
+        if INSTALL.exists():
+            os.replace(INSTALL, INSTALL.with_name('tenant-selfsteal.previous-' + identifier))
+        os.replace(staged, INSTALL)
+        PACKAGE = INSTALL
+    mark_package(config)
+    install_launcher()
+    render_caddy(config)
+    install_units()
+    expected = None
+    if (STATE / 'certs/current/fullchain.pem').exists():
+        try:
+            expected = validate_certificate(config, STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem')
+        except Failure:
+            print('⚠️ Сохранённый сертификат требует проверки/продления; автоматического выпуска не будет.')
+    if expected is not None:
+        compose('up', '-d', '--no-build', 'caddy')
+        reload_caddy()
+        verify_served(config, expected)
+        lifecycle_stage('ready')
+    else:
+        lifecycle_stage('awaiting_http')
+    print('✅ Восстановлены прежние данные. Исходная резервная копия сохранена. Запрос в CA не отправлен.')
+
+
+def recover_operation():
+    path = STATE / 'operation.json'
+    if not path.exists():
+        abort_acme()
+        return
+    with resource_lock():
+        record = read_json(path)
+        identifier = record.get('operation_id')
+        if not operation_record(identifier):
+            raise Failure('Повреждён журнал операции.', 'OWNERSHIP_UNKNOWN')
+        record['state'] = 'recovering'
+        atomic_json(path, record)
+    abort_acme(identifier)
+    stop_scoped_transient(identifier, 'probe')
+    stop_scoped_transient(identifier, 'watchdog', 'service')
+    with resource_lock():
+        if operation_record(identifier):
+            path.unlink()
+
+
+def queue_retry():
+    """One delayed retry per busy episode; never a second periodic scheduler."""
+    if not CONFIG.exists() or not STATE.exists():
+        return
+    config = validate_config(read_json(CONFIG))
+    identifier = config.get('install_id')
+    if not identifier:
+        return
+    if (STATE / 'uninstall.json').exists():
+        return
+    with resource_lock():
+        path = STATE / 'retry.json'
+        if path.exists():
+            prior = read_json(path)
+            if prior.get('install_id') != identifier:
+                raise Failure('Владелец отложенного повтора не подтверждён.', 'OWNERSHIP_UNKNOWN')
+            if prior.get('created_at', 0) + 3600 > time.time():
+                return
+        retry_id = uuid.uuid4().hex
+        unit = 'tenant-selfsteal-retry-' + identifier + '-' + retry_id
+        assert_transient_available(unit + '.timer')
+        assert_transient_available(unit + '.service')
+        atomic_json(path, dict(install_id=identifier, retry_id=retry_id, unit=unit, state='pending', created_at=int(time.time())))
+        description = 'Transitclient renewal retry ' + identifier + ' ' + retry_id
+        run(['systemd-run', '--unit=' + unit, '--on-active=5min', '--collect',
+             '--description=' + description, '--timer-property=Description=' + description,
+             '--property=RuntimeMaxSec=21min', '/usr/bin/python3', INSTALL / 'selfsteal.py',
+             '_retry-renew', '--retry-install-id', identifier, '--operation-id', retry_id])
+
+
+def retry_renew(identifier, retry_id=None):
+    if not CONFIG.exists() or not (STATE / 'retry.json').exists():
+        return
+    with resource_lock():
+        config, record = read_json(CONFIG), read_json(STATE / 'retry.json')
+        if (not retry_id or record.get('retry_id') != retry_id or record.get('install_id') != identifier
+                or config.get('install_id') != identifier or record.get('state') != 'pending'):
+            return
+        if (STATE / 'uninstall.json').exists():
+            return
+        record['state'] = 'fired'
+        atomic_json(STATE / 'retry.json', record)
+    stop_retry_unit(record, 'timer')
+    # Do not hold either lock while systemctl waits for the renewal worker.
+    check_install_resources()
+    run(['systemctl', 'start', 'tenant-selfsteal-renew.service'], timeout=ACME_TIMEOUT + 180)
+
+
+def stop_retry():
+    path = STATE / 'retry.json'
+    if not path.exists():
+        return
+    record = read_json(path)
+    identifier = read_json(CONFIG).get('install_id')
+    if record.get('install_id') != identifier:
+        raise Failure('Владелец отложенного повтора не подтверждён.', 'OWNERSHIP_UNKNOWN')
+    for suffix in ('timer', 'service'):
+        stop_retry_unit(record, suffix)
+    path.unlink()
+
+
+def stop_retry_unit(record, suffix):
+    identifier, retry_id = record.get('install_id'), record.get('retry_id')
+    if not all(re.fullmatch(r'[0-9a-f]{32}', value or '') for value in (identifier, retry_id)):
+        raise Failure('Повреждён журнал отложенного повтора.', 'OWNERSHIP_UNKNOWN')
+    unit = 'tenant-selfsteal-retry-' + identifier + '-' + retry_id
+    if record.get('unit') != unit:
+        raise Failure('Владелец отложенного повтора не подтверждён.', 'OWNERSHIP_UNKNOWN')
+    properties = transient_state(unit + '.' + suffix)
+    if properties.get('LoadState', 'not-found') == 'not-found':
+        return
+    proof = properties.get('Triggers') == unit + '.service' if suffix == 'timer' else (
+        str(INSTALL / 'selfsteal.py') in properties.get('ExecStart', '')
+        and '_retry-renew' in properties.get('ExecStart', '') and identifier in properties.get('ExecStart', '')
+        and retry_id in properties.get('ExecStart', ''))
+    if properties.get('Description') != 'Transitclient renewal retry ' + identifier + ' ' + retry_id or not proof:
+        raise Failure('Владелец отложенного unit не подтверждён.', 'OWNERSHIP_UNKNOWN')
+    run(['systemctl', 'stop', unit + '.' + suffix])
+
+
 def dispatch(args):
+    activate = args.command in ('install', 'update', '_recover', 'firewall-confirm', 'restore', 'configure') and not (
+        args.command == '_recover' and os.environ.get('INVOCATION_ID'))
+    try:
+        result = _dispatch(args)
+    except BaseException:
+        # A committed partial installation still needs renewal scheduling. Keep
+        # the original exception if schedule verification itself fails.
+        if activate:
+            try:
+                activate_schedule()
+            except (Failure, OSError, ValueError, subprocess.SubprocessError):
+                print('⚠️ Расписание требует проверки: transitclient diagnose.', file=sys.stderr)
+        raise
+    if activate:
+        activate_schedule()
+    return result
+
+
+def _dispatch(args):
     command = args.command
     interactive = getattr(args, '_menu_mode', False)
     if command == 'self-test' and interactive and not args.http01 and not args.vpn:
@@ -1803,21 +2487,33 @@ def dispatch(args):
     require_host()
     os.umask(0o077)
     if command == '_cleanup':
-        cleanup_firewall()
+        cleanup_firewall(getattr(args, 'operation_id', None))
         return 0
     if command == '_abort':
-        abort_acme()
+        abort_acme(getattr(args, 'operation_id', None))
         return 0
-    config = validate_config(read_json(CONFIG)) if CONFIG.exists() else None
+    if command == '_retry-renew':
+        retry_renew(args.retry_install_id, getattr(args, 'operation_id', None))
+        return 0
+    config = validate_config(read_json(CONFIG)) if CONFIG.exists() and command in ('_open', '_probe-server', '_update-apply') else None
     if command in ('_open', '_probe-server'):
+        identifier = getattr(args, 'operation_id', None)
+        record = operation_record(identifier)
+        if not record or record.get('state', 'active') != 'active' or record.get('deadline', 0) <= time.time():
+            raise Failure('Устаревший либо неподтверждённый обработчик операции.', 'OPERATION_EXPIRED')
         if config is None:
             raise Failure('Установка ещё не настроена.', 'NOT_INSTALLED')
         if command == '_open':
-            open_firewall(config)
+            open_firewall(config, identifier)
         else:
             probe_server(config, args.probe_token)
         return 0
     if command == '_update-apply':
+        journal = STATE / 'update-transaction.json'
+        transaction = read_json(journal) if journal.exists() else {}
+        if (transaction.get('id') != getattr(args, 'operation_id', None)
+                or transaction.get('parent_pid') != os.getppid()):
+            raise Failure('Обновление должно выполняться дочерним процессом владельца блокировки.', 'OPERATION_EXPIRED')
         if config is None:
             raise Failure('Установка ещё не настроена.', 'NOT_INSTALLED')
         check_install_resources()
@@ -1843,28 +2539,53 @@ def dispatch(args):
         reload_caddy()
         verify_served(config, validate_certificate(config, chain, key))
         return 0
-    with lifecycle_lock():
+    with lifecycle_lock(wait=30 if getattr(args, 'worker', False) else 0):
+        if command in ('_recover', 'uninstall') and resume_uninstall():
+            return 0
+        # A waiting worker must use the settings committed by the previous owner.
+        config = validate_config(read_json(CONFIG)) if CONFIG.exists() else None
         if command == 'install':
             # Preflight must not stop services, clean rules or replace files.
             install(args)
+            return 0
+        if command == 'restore':
+            restore_backup(args)
             return 0
         if config is None:
             raise Failure('Сначала выполните install.', 'NOT_INSTALLED')
         assert_local_docker()
         if command == 'self-test':
             if args.http01:
-                http_self_test(config)
+                http_self_test(config, external_check=getattr(args, 'external_check', False))
             if args.vpn:
                 vpn_self_test(config)
             return 0
         check_install_resources()
+        if command == 'firewall-confirm':
+            firewall = firewall_module()
+            try:
+                firewall.confirm_activation(STATE, config, args.confirmation_token, run, atomic_json)
+            except firewall.FirewallError as exc:
+                raise Failure(str(exc), exc.code) from exc
+            lifecycle_stage('runtime_ready')
+            try:
+                http_self_test(config, approved=True)
+            except Failure as exc:
+                lifecycle_stage('awaiting_http', reason=exc.code)
+                print('UFW подтверждён. HTTP-путь ожидает проверки: transitclient self-test --http01.')
+                return 0
+            renew(config)
+            return 0
         if (STATE / 'ufw-activation.json').exists():
+            if command != '_recover':
+                raise Failure('UFW ожидает подтверждения из нового SSH. Используйте firewall-confirm '
+                              'или _recover для отката.', 'FIREWALL_CONFIRMATION_REQUIRED')
             firewall = firewall_module()
             try:
                 firewall.recover_activation(STATE, run, atomic_json)
             except firewall.FirewallError as exc:
                 raise Failure(str(exc), exc.code) from exc
-        abort_acme()
+        recover_operation()
         recover_update()
         recover_configuration()
         recover_certificate()
@@ -1872,7 +2593,20 @@ def dispatch(args):
         config = validate_config(read_json(CONFIG))
         if command == '_recover':
             return 0
-        {'renew': lambda: renew(config), 'configure': lambda: configure(config, getattr(args, '_configure_choice', None)),
+        if command == 'renew' and getattr(args, 'worker', False) and (STATE / 'lifecycle.json').exists():
+            if read_json(STATE / 'lifecycle.json').get('stage') in ('awaiting_http', 'awaiting_firewall', 'preparing', 'uninstalling'):
+                print('Первый выпуск ожидает готовности установки; запрос в CA не отправлен.')
+                return 0
+            if not read_json(STATE / 'lifecycle.json').get('issuance_authorized'):
+                print('Первый выпуск ещё не разрешён владельцем; запрос в CA не отправлен.')
+                return 0
+        if command == 'renew' and not getattr(args, 'worker', False) and (STATE / 'lifecycle.json').exists():
+            lifecycle = read_json(STATE / 'lifecycle.json')
+            if lifecycle.get('stage') in ('certificate_pending', 'ready') and not lifecycle.get('issuance_authorized'):
+                if not confirm('Разрешить выпуск/продление восстановленной установки в выбранной CA?'):
+                    raise Failure('Выпуск отменён.', 'CANCELLED')
+                lifecycle_stage(lifecycle['stage'], issuance_authorized=True)
+        {'renew': lambda: renew(config), 'configure': lambda: configure(config, getattr(args, '_configure_choice', None), getattr(args, 'firewall', None)),
          'update': lambda: update(config, args), 'template': lambda: change_template(config, select_template(args.template, rollback=True)),
          'uninstall': uninstall}[command]()
     return 0
@@ -1887,11 +2621,16 @@ def perform(args):
             return 0 if getattr(args, '_menu_mode', False) else 1
         message = str(exc) if isinstance(exc, Failure) else 'Не удалось завершить операцию: ' + type(exc).__name__ + '. Используйте diagnose.'
         code = exc.code if isinstance(exc, Failure) else type(exc).__name__
-        if STATE.exists() and CONFIG.exists() and args.command not in ('status', 'diagnose', 'guide', 'self-test', '_cleanup', '_open'):
+        if code == 'OPERATION_BUSY' and getattr(args, 'worker', False):
+            try:
+                queue_retry()
+            except (Failure, OSError, ValueError, subprocess.SubprocessError):
+                print('⚠️ Отложенный повтор требует проверки systemd.', file=sys.stderr)
+        if code != 'OPERATION_BUSY' and not args.command.startswith('_') and STATE.exists() and CONFIG.exists() and args.command not in ('status', 'diagnose', 'guide', 'self-test'):
             atomic_json(STATE / 'result.json', {'success': False, 'at': int(time.time()),
                                               'error': code, 'message': message, 'stage': args.command})
         print('❌ [' + code + '] ' + message, file=sys.stderr)
-        return 1
+        return 75 if code == 'OPERATION_BUSY' else 1
 
 
 def menu(args):
@@ -1902,7 +2641,7 @@ def menu(args):
 def main():
     parser = argparse.ArgumentParser(description='HTTP-01 tenant selfsteal без API сервиса')
     parser.add_argument('command', nargs='?', default='menu', choices=['menu', 'install', 'configure', 'status', 'diagnose', 'self-test', 'renew', 'update',
-                                          'uninstall', 'template', 'guide', 'help', 'version', '_open', '_cleanup', '_abort', '_recover', '_update-apply', '_probe-server'])
+                                          'uninstall', 'restore', 'template', 'guide', 'help', 'version', 'firewall-confirm', '_open', '_cleanup', '_abort', '_recover', '_update-apply', '_probe-server', '_retry-renew'])
     parser.add_argument('--template', help='Номер сайта 1–11, random, builtin или rollback (после установки)')
     parser.add_argument('--staging-ca-file', help='Явный trust bundle тестовой CA, только новая установка')
     parser.add_argument('--package-url')
@@ -1915,12 +2654,18 @@ def main():
     parser.add_argument('--local-port')
     parser.add_argument('--docker-network')
     parser.add_argument('--vpn-container')
-    parser.add_argument('--firewall', choices=['ufw', 'manual'], help='Управление UFW (по умолчанию) или собственный firewall')
+    parser.add_argument('--firewall', choices=['auto', 'ufw', 'preserve', 'manual'], help='auto (по умолчанию), ufw или сохранение firewall: preserve')
+    parser.add_argument('--operation-id', help=argparse.SUPPRESS)
+    parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--retry-install-id', help=argparse.SUPPRESS)
+    parser.add_argument('--confirmation-token', help='Одноразовое подтверждение UFW из нового SSH')
+    parser.add_argument('--backup', help='Явно выбранная локальная резервная копия для restore')
     parser.add_argument('--probe-token', help=argparse.SUPPRESS)
     parser.add_argument('--json', action='store_true', help='JSON отчёт status/diagnose/self-test')
     parser.add_argument('--full', action='store_true', help='Подробный отчёт diagnose')
     parser.add_argument('--no-color', action='store_true', help='Без ANSI цветов в интерактивном меню')
     parser.add_argument('--http01', action='store_true', help='Явный временный HTTP self-test, без ACME')
+    parser.add_argument('--external-check', action='store_true', help='При NAT hairpin явно подтвердить nonce с внешней машины')
     parser.add_argument('--vpn', action='store_true', help='Явная TLS-проверка в указанном VPN-контейнере')
     args = parser.parse_args()
     if args.command == 'help':
@@ -1928,6 +2673,8 @@ def main():
         return
     if (args.http01 or args.vpn) and args.command != 'self-test':
         parser.error('--http01/--vpn применимы только к self-test')
+    if args.external_check and (args.command != 'self-test' or not args.http01):
+        parser.error('--external-check применим только к self-test --http01')
     if args.full and args.command != 'diagnose':
         parser.error('--full применим только к diagnose')
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))

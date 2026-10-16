@@ -137,6 +137,8 @@ def safe_extract(archive_path, destination, version, digest):
                 'LICENSE', 'NOTICE.md', 'vendor/acme.sh', 'site/index.html'}
     if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 4, 0):
         required.update({'client_panel.py', 'terminal_ui.py'})
+    if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 5, 0):
+        required.add('renewal_schedule.py')
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0
         for entry in archive:

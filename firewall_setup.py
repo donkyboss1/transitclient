@@ -72,10 +72,8 @@ def _docker_chain(value):
 
 
 def _native_filters(run, docker_host_only=False, active_ufw=False):
-    evidence = []
     for command in ('iptables-save', 'ip6tables-save'):
         text = _read(run, [command])
-        evidence.append(re.sub(r'\[\d+:\d+\]', '[0:0]', '\n'.join(line for line in text.splitlines() if not line.startswith('#'))))
         table = None
         for line in text.splitlines():
             if line.startswith('*'):
@@ -155,16 +153,6 @@ def _native_filters(run, docker_host_only=False, active_ufw=False):
         for binary in ('iptables', 'ip6tables'):
             if 'nf_tables' in _read(run, [binary, '--version']):
                 raise FirewallError('Для проверки nft-backend нужен nft; включение UFW запрещено.')
-    # Raw nft JSON includes changing packet counters and generation handles.
-    # Safety was checked above; keep structure without volatile metadata.
-    def stable(value):
-        if isinstance(value, dict):
-            return {k: stable(v) for k, v in value.items() if k not in ('metainfo', 'handle', 'counter', 'packets', 'bytes')}
-        if isinstance(value, list):
-            return [stable(v) for v in value]
-        return value
-    evidence.append(stable(json.loads(nft)) if nft is not None else None)
-    return evidence
 
 
 def _defaults():

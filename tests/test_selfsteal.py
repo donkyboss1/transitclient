@@ -474,6 +474,23 @@ def test_tar_traversal_rejected_before_update_mutation(app, config, tmp_path, mo
     assert not app.INSTALL.exists()
 
 
+def test_update_requires_schedule_module_before_host_calls(app, config, tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    app.copy_package(PACKAGE, source)
+    (source / 'VERSION').write_text('1.5.0')
+    (source / 'renewal_schedule.py').unlink()
+    release = tmp_path / 'release.tar.gz'
+    with tarfile.open(release, 'w:gz') as archive:
+        for path in source.rglob('*'):
+            if path.is_file():
+                archive.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
+    monkeypatch.setattr(app, 'verified_download', lambda _, __, destination: shutil.copyfile(release, destination))
+    monkeypatch.setattr(app, 'run', lambda *_, **__: pytest.fail('Incomplete update touched host'))
+    with pytest.raises(app.Failure, match='модуль расписания'):
+        app.update(config, SimpleNamespace(package_url='https://owner.example/release.tar.gz', sha256='a' * 64, version='1.5.0'))
+    assert not app.INSTALL.exists()
+
+
 def test_unpublished_update_has_no_network_fallback(app, config, monkeypatch):
     monkeypatch.setattr(app, 'verified_download', lambda *a: pytest.fail('unexpected network'))
     args = SimpleNamespace(package_url=None, sha256=None, version=None)
@@ -931,9 +948,8 @@ def test_install_docker_nat_conflict_is_read_only(app, config, monkeypatch):
 
 
 def test_http_probe_nonce_success_stops_only_owned_unit_and_never_ca(app, config, monkeypatch):
-    from contextlib import nullcontext
     events = []
-    monkeypatch.setattr(app, 'check_dns', lambda _: None)
+    monkeypatch.setattr(app, 'check_dns', lambda _: ['8.8.8.8'])
     monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
     monkeypatch.setattr(app, 'confirm', lambda _: True)
     monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
@@ -943,13 +959,21 @@ def test_http_probe_nonce_success_stops_only_owned_unit_and_never_ca(app, config
     calls = []
     monkeypatch.setattr(app, 'run', lambda args, **kw: calls.append(args) or result())
     class Response:
+        status = 200
+
         def read(self, *_):
             return b'transitclient-check:' + b'a' * 32
-    class Opener:
-        def open(self, address, **_):
-            assert address.startswith('http://bob.example.com/.well-known/acme-challenge/')
-            return nullcontext(Response())
-    monkeypatch.setattr(app.urllib.request, 'build_opener', lambda *_: Opener())
+    class Connection:
+        def request(self, method, path, headers):
+            assert method == 'GET' and path.startswith('/.well-known/acme-challenge/')
+            assert headers['Host'] == config['domain']
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+    monkeypatch.setattr(app.http.client, 'HTTPConnection', lambda *_, **__: Connection())
     app.http_self_test(config)
     assert events == ['open', 'stop-owned']
     launches = [call for call in calls if call[0] == 'systemd-run']
@@ -1279,8 +1303,7 @@ def test_ctrl_c_during_reconfiguration_rolls_back_before_propagating(app, config
 
 @pytest.mark.parametrize('interruption', [KeyboardInterrupt, EOFError])
 def test_http_test_cleans_owned_probe_before_interrupt(app, config, monkeypatch, interruption):
-    from contextlib import nullcontext
-    monkeypatch.setattr(app, 'check_dns', lambda _: None)
+    monkeypatch.setattr(app, 'check_dns', lambda _: ['8.8.8.8'])
     monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
     monkeypatch.setattr(app, 'confirm', lambda _: True)
     monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
@@ -1289,15 +1312,23 @@ def test_http_test_cleans_owned_probe_before_interrupt(app, config, monkeypatch,
     monkeypatch.setattr(app, 'run', lambda args, **k: (events.append('launch') if args[0] == 'systemd-run' else None) or result())
     monkeypatch.setattr(app, 'stop_probe', lambda: events.append('stop-owned'))
     class Response:
+        status = 200
+
         def read(self, *_):
             raise interruption
-    class Opener:
-        def open(self, *_args, **_kwargs):
-            return nullcontext(Response())
-    monkeypatch.setattr(app.urllib.request, 'build_opener', lambda *_: Opener())
+    class Connection:
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            events.append('connection-closed')
+    monkeypatch.setattr(app.http.client, 'HTTPConnection', lambda *_, **__: Connection())
     with pytest.raises(interruption):
         app.http_self_test(config)
-    assert events == ['open', 'launch', 'stop-owned']
+    assert events == ['open', 'launch', 'connection-closed', 'stop-owned']
 
 
 def test_renew_interrupt_aborts_acme_and_does_not_apply_certificate(app, config, monkeypatch):

@@ -9,7 +9,7 @@ import pytest
 
 
 @pytest.fixture
-def fw(tmp_path, monkeypatch):
+def fw(tmp_path, monkeypatch, root_path):
     spec = importlib.util.spec_from_file_location('tested_firewall_setup', Path(__file__).parents[1] / 'firewall_setup.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -21,6 +21,8 @@ def fw(tmp_path, monkeypatch):
     default.write_text('IPV6=yes\nMANAGE_BUILTINS=no\nDEFAULT_OUTPUT_POLICY="ACCEPT"\nDEFAULT_INPUT_POLICY="DROP"\n')
     monkeypatch.setattr(module, 'UFW_DIR', directory)
     monkeypatch.setattr(module, 'UFW_DEFAULT', default)
+    monkeypatch.setattr(module, 'Path', root_path)
+    monkeypatch.setattr(module.os, 'geteuid', lambda: 0, raising=False)
     monkeypatch.delenv('SSH_CONNECTION', raising=False)
     return module
 
@@ -420,3 +422,14 @@ def test_fresh_ssh_rejects_new_channel_on_existing_controlmaster(fw, tmp_path, m
         return SimpleNamespace(returncode=0, stdout=('0 0 1.1.1.1:2022 8.8.8.8:50000 users:((' + owners + '))').encode())
     journal = dict(activated_uptime=1000, rules=[dict(port=2022, protocol='tcp')])
     assert fw.fresh_ssh(journal, run) is not old_transport
+
+
+def test_activation_still_rejects_non_root_before_mutations(fw, config, report, tmp_path, monkeypatch):
+    run = Runner(fw)
+    prepared = fw.plan(config, report, run)
+    monkeypatch.setattr(fw.os, 'geteuid', lambda: 1000)
+    calls = len(run.calls)
+    with pytest.raises(fw.FirewallError, match='root'):
+        fw.apply(prepared, config, tmp_path / 'state', run, atomic)
+    assert len(run.calls) == calls
+    assert not (tmp_path / 'state').exists()

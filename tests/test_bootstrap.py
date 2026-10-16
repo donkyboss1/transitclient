@@ -31,6 +31,7 @@ def release(tmp_path, additions=(), omit=(), version='1.2.3', bad_acme=False,
              'diagnostics.py': b'# diagnostics\n', 'site_templates.py': b'# templates\n',
              'firewall_setup.py': b'# firewall\n', 'templates.json': b'{}',
              'terminal_ui.py': b'# ui\n', 'client_panel.py': b'# panel\n',
+             'renewal_schedule.py': b'# schedule\n',
              'docs/integration.md': b'# Integration\n',
              'VERSION': version.encode(), 'LICENSE': b'MIT', 'NOTICE.md': b'DigneZzZ',
              'site/index.html': b'<p>Hello</p>', 'vendor/acme.sh': acme,
@@ -114,6 +115,13 @@ def test_wrong_release_version_rejected(extractor, tmp_path):
 @pytest.mark.parametrize('helper', ['terminal_ui.py', 'client_panel.py'])
 def test_ui_release_requires_both_terminal_helpers(extractor, tmp_path, helper):
     args = release(tmp_path, version='1.4.0', omit=[helper])
+    with pytest.raises(ValueError, match='неполон'):
+        extractor[0](*args)
+    assert not args[1].exists()
+
+
+def test_schedule_module_required_since_150(extractor, tmp_path):
+    args = release(tmp_path, version='1.5.0', omit=['renewal_schedule.py'])
     with pytest.raises(ValueError, match='неполон'):
         extractor[0](*args)
     assert not args[1].exists()

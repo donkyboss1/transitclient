@@ -6,9 +6,9 @@ set -euo pipefail
 umask 077
 
 # Publication fills these three values together. Never guess a repository URL.
-RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.5.0.tar.gz'
-RELEASE_VERSION='1.5.0'
-RELEASE_SHA256='b93278efe6f4b557b2770050abf3b52baeb0e435317f1ae97f57d8a2d261702d'
+RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.5.1.tar.gz'
+RELEASE_VERSION='1.5.1'
+RELEASE_SHA256='8d0a964175d86b925a2f33dd566d3547ed56845148020007767bf3c83844c5a8'
 
 fail() { printf '\n❌ %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -137,6 +137,8 @@ def safe_extract(archive_path, destination, version, digest):
                 'LICENSE', 'NOTICE.md', 'vendor/acme.sh', 'site/index.html'}
     if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 4, 0):
         required.update({'client_panel.py', 'terminal_ui.py'})
+    if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 5, 0):
+        required.add('renewal_schedule.py')
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0
         for entry in archive:

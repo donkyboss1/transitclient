@@ -290,6 +290,7 @@ def check_dns(config):
     if config.get('relay_ip') and values != {config['relay_ip']}:
         raise Failure('A/AAAA не совпадают с ожидаемым IP релея. Проверьте DNS в боте; '
                       'лишний/неверный AAAA тоже блокирует проверку.')
+    return sorted(values)
 
 
 def require_host():
@@ -1301,10 +1302,24 @@ def snapshot_units():
 def restore_units(values):
     # All names were proved owned by the caller before rollback. Stop before
     # rewriting; otherwise a newly enabled timer can survive a missing old file.
+    current_unit = None
+    invocation = os.environ.get('INVOCATION_ID')
+    if invocation:
+        for name in ('recover.service', 'renew.service'):
+            unit = 'tenant-selfsteal-' + name
+            if run(['systemctl', 'show', unit, '-p', 'InvocationID', '--value']).stdout.decode().strip() == invocation:
+                current_unit = unit
+                break
+        if current_unit is None:
+            raise Failure('Не удалось определить службу восстановления.', 'SYSTEMD_STATE_UNKNOWN')
+    protected = {current_unit}
+    if current_unit == 'tenant-selfsteal-renew.service':
+        # Requires=recover.service would stop this worker along with recovery.
+        protected.add('tenant-selfsteal-recover.service')
     for name in values:
         if name not in ('renew.service', 'renew.timer', 'recover.service'):
             raise Failure('Неизвестный unit в резервной копии.', 'RECOVERY_INVALID')
-        if (UNITS / ('tenant-selfsteal-' + name)).exists():
+        if (UNITS / ('tenant-selfsteal-' + name)).exists() and 'tenant-selfsteal-' + name not in protected:
             run(['systemctl', 'disable', '--now', 'tenant-selfsteal-' + name])
     for name, item in values.items():
         if name not in ('renew.service', 'renew.timer', 'recover.service'):
@@ -1321,7 +1336,7 @@ def restore_units(values):
         unit = 'tenant-selfsteal-' + name
         run(['systemctl', 'enable' if item['enabled'] else 'disable', unit])
         # Do not resurrect an ACME worker from a stale active service snapshot.
-        if name != 'renew.service' and not item['active']:
+        if name != 'renew.service' and not item['active'] and unit not in protected:
             run(['systemctl', 'stop', unit])
     atomic_json(STATE / 'units-restore-pending.json', values)
 
@@ -1335,7 +1350,8 @@ def activate_restored_units():
     for name in ('recover.service', 'renew.timer'):
         item = values.get(name, {})
         if item.get('content') is not None and item.get('active'):
-            run(['systemctl', 'start', 'tenant-selfsteal-' + name])
+            # Recovery may still be starting; never wait on our own unit/dependants.
+            run(['systemctl', 'start', '--no-block', 'tenant-selfsteal-' + name])
     path.unlink()
 
 
@@ -1497,6 +1513,8 @@ def detect_vpn_network(config, report):
 
 
 def check_install_resources():
+    if CONFIG.with_name('restore-transaction.json').exists():
+        raise Failure('Восстановление прервано. Выполните transitclient _recover или повторите restore.', 'RESTORE_RECOVERY_REQUIRED')
     if CONFIG.with_name('uninstall-transaction.json').exists():
         raise Failure('Удаление прервано. Завершите его через transitclient _recover.', 'UNINSTALL_RECOVERY_REQUIRED')
     if CONFIG.is_symlink() or INSTALL.is_symlink() or STATE.is_symlink():
@@ -1985,7 +2003,7 @@ def http_self_test(config, *, approved=False, external_check=False):
 
 
 def _http_self_test(config, *, approved=False, external_check=False):
-    check_dns(config)
+    addresses = check_dns(config)
     check_challenge_port(config)
     print(f"🔍 Временный HTTP self-test: домен:80 релея → backend:{config['challenge_port']}.")
     print('Это сетевой тест из текущей точки, без CA и выпуска сертификата. Firewall/слушатель будут временными.')
@@ -2009,23 +2027,36 @@ def _http_self_test(config, *, approved=False, external_check=False):
              '--property=ExecStopPost=/usr/bin/python3 /opt/tenant-selfsteal/selfsteal.py _cleanup --operation-id ' + identifier,
              '/usr/bin/python3', INSTALL / 'selfsteal.py', '_probe-server', '--operation-id', identifier, '--probe-token', token])
         created = True
-        response = None
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        for _ in range(5):
-            try:
-                with opener.open(address, timeout=5) as upstream:
-                    response = upstream.read(128)
-                break
-            except OSError:
-                time.sleep(1)
-        if response != ('transitclient-check:' + token).encode():
+        results = []
+        for ip in addresses:
+            confirmed = False
+            for _ in range(5):
+                remaining = 120 - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                connection = http.client.HTTPConnection(ip, 80, timeout=min(5, remaining))
+                try:
+                    connection.request('GET', '/.well-known/acme-challenge/' + token,
+                                       headers={'Host': config['domain'], 'Connection': 'close'})
+                    upstream = connection.getresponse()
+                    confirmed = upstream.status == 200 and upstream.read(128) == ('transitclient-check:' + token).encode()
+                    break
+                except (OSError, http.client.HTTPException):
+                    time.sleep(min(1, max(0, 120 - (time.monotonic() - started))))
+                finally:
+                    connection.close()
+            results.append(dict(address=ip, confirmed=confirmed))
+        if not results or not all(row['confirmed'] for row in results):
             if not external_check:
                 raise Failure('HTTP-путь не подтверждён из этой точки. Проверьте готовность маршрута в боте, '
                               'NAT/firewall; при NAT hairpin повторите self-test --http01 --external-check '
                               'с независимой внешней машиной.', 'HTTP_PATH_UNCONFIRMED')
             print('Локальная проверка не подтвердилась. Пока работает слушатель, проверьте показанный URL с внешней машины.')
+            for ip in addresses:
+                resolved = '[' + ip + ']' if ':' in ip else ip
+                print('curl --fail --noproxy "*" --resolve ' + shlex.quote(config['domain'] + ':80:' + resolved) + ' ' + shlex.quote(address))
             print('Требуется точный ответ: transitclient-check:' + token)
-            if not confirm('Внешняя машина получила HTTP200 и точный контрольный ответ для этого URL?') or time.monotonic() - started >= 120:
+            if not confirm('Внешняя машина получила HTTP200 и точный ответ для КАЖДОГО указанного A/AAAA?') or time.monotonic() - started >= 120:
                 raise Failure('Внешняя проверка не подтверждена либо её срок истёк.', 'HTTP_PATH_UNCONFIRMED')
             scope = 'operator_reported'
             print('⚠️ Внешний HTTP-путь подтверждён по вашему сообщению; установщик не проверял внешнюю машину.')
@@ -2034,7 +2065,7 @@ def _http_self_test(config, *, approved=False, external_check=False):
         fingerprint = hashlib.sha256(json.dumps({key: config.get(key) for key in
                         ('domain', 'relay_ip', 'challenge_port')}, sort_keys=True).encode()).hexdigest()
         atomic_json(STATE / 'http-path.json', dict(status='confirmed', scope=scope, at=int(time.time()),
-                    install_id=config['install_id'], fingerprint=fingerprint))
+                    install_id=config['install_id'], fingerprint=fingerprint, addresses=results))
         if (STATE / 'lifecycle.json').exists():
             lifecycle = read_json(STATE / 'lifecycle.json')
             if lifecycle.get('stage') in ('runtime_ready', 'awaiting_http', 'certificate_pending'):
@@ -2045,11 +2076,6 @@ def _http_self_test(config, *, approved=False, external_check=False):
             stop_probe()
         else:
             cleanup_firewall()
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_):
-        raise Failure('HTTP-маршрут вернул redirect вместо диагностического ответа.', 'HTTP_REDIRECT')
 
 
 def vpn_self_test(config):
@@ -2133,6 +2159,8 @@ def update(config, args):
         if tuple(int(part) for part in version.split('.')) >= (1, 4, 0):
             if not all((extracted / name).is_file() for name in ('terminal_ui.py', 'client_panel.py')):
                 raise Failure('Неполный артефакт обновления: отсутствует интерфейс.')
+        if tuple(int(part) for part in version.split('.')) >= (1, 5, 0) and not (extracted / 'renewal_schedule.py').is_file():
+            raise Failure('Неполный артефакт обновления: отсутствует модуль расписания.')
         deps = read_json(extracted / 'dependencies.json')
         if hashlib.sha256((extracted / 'vendor/acme.sh').read_bytes()).hexdigest() != deps['acme']['sha256']:
             raise Failure('acme.sh в обновлении не соответствует манифесту.')
@@ -2253,6 +2281,37 @@ def resume_uninstall():
     return True
 
 
+def recover_restore():
+    """Preserve interrupted publication; the selected source backup stays intact."""
+    marker = CONFIG.with_name('restore-transaction.json')
+    if not marker.exists():
+        return False
+    transaction = read_json(marker)
+    identifier = transaction.get('id', '')
+    if not re.fullmatch(r'[0-9a-f]{32}', identifier):
+        raise Failure('Журнал восстановления требует ручной сверки.', 'RESTORE_RECOVERY_REQUIRED')
+    config = transaction['config']
+    if CONFIG.exists() and (CONFIG.is_symlink() or read_json(CONFIG) != config):
+        raise Failure('Конфигурация изменилась после начала восстановления.', 'RESTORE_RECOVERY_REQUIRED')
+    saved = STATE.with_name('tenant-selfsteal-restore-interrupted-' + identifier)
+    proof = 'restore-publication.json'
+    for path in (STATE, saved):
+        if path.is_symlink():
+            raise Failure('Путь восстановления занят ссылкой.', 'RESTORE_RECOVERY_REQUIRED')
+        if path.exists() and any(path.iterdir()):
+            if not (path / proof).is_file() or (path / proof).is_symlink() or read_json(path / proof) != {'id': identifier}:
+                raise Failure('Принадлежность данных восстановления не подтверждена.', 'RESTORE_RECOVERY_REQUIRED')
+    if STATE.exists() and any(STATE.iterdir()):
+        if saved.exists():
+            raise Failure('Данные восстановления неоднозначны.', 'RESTORE_RECOVERY_REQUIRED')
+        os.replace(STATE, saved)
+    CONFIG.unlink(missing_ok=True)
+    marker.unlink()
+    print('Прерванный перенос отменён; исходная резервная копия сохранена.'
+          + (' Незавершённые данные: ' + str(saved) if saved.exists() else ''))
+    return True
+
+
 def restore_backup(args):
     """Restore only explicit local owner backups, using this trusted runtime."""
     if not getattr(args, 'backup', None):
@@ -2282,6 +2341,8 @@ def restore_backup(args):
     if changed_domain:
         config['domain'] = domain_value(args.domain)
         config['relay_ip'] = getattr(args, 'relay_ip', None) or ''
+    if config['ca'] == STAGING:
+        config['staging_ca_file'] = str(STATE / 'staging-trust.pem')
     if CONFIG.exists() or STATE.exists() and any(STATE.iterdir()):
         raise Failure('Активные данные уже существуют. Восстановление поверх них запрещено.', 'RESTORE_CONFLICT')
     check_install_resources()
@@ -2300,6 +2361,9 @@ def restore_backup(args):
                 shutil.copytree(item, staged / name, symlinks=True)
             elif item.is_file():
                 shutil.copy2(item, staged / name)
+        identifier = uuid.uuid4().hex
+        atomic_json(staged / 'restore-publication.json', {'id': identifier})
+        atomic_json(CONFIG.with_name('restore-transaction.json'), {'id': identifier, 'config': config})
         STATE.mkdir(mode=0o700, exist_ok=True)
         STATE.rmdir()  # Known empty; rename publishes the complete staged state.
         os.replace(staged, STATE)
@@ -2309,10 +2373,10 @@ def restore_backup(args):
             current.unlink()
         elif current.exists():
             os.replace(current, current.with_name('restored-unselected-' + uuid.uuid4().hex))
-    if config['ca'] == STAGING:
-        config['staging_ca_file'] = str(STATE / 'staging-trust.pem')
     atomic_json(CONFIG, config)
     lifecycle_stage('preparing', issuance_authorized=False)
+    CONFIG.with_name('restore-transaction.json').unlink()
+    (STATE / 'restore-publication.json').unlink()
     dependencies()
     global PACKAGE
     if PACKAGE != INSTALL:
@@ -2446,19 +2510,22 @@ def stop_retry_unit(record, suffix):
 def dispatch(args):
     activate = args.command in ('install', 'update', '_recover', 'firewall-confirm', 'restore', 'configure') and not (
         args.command == '_recover' and os.environ.get('INVOCATION_ID'))
+    restore = args.command in ('renew', 'template', '_recover')
     try:
         result = _dispatch(args)
     except BaseException:
         # A committed partial installation still needs renewal scheduling. Keep
         # the original exception if schedule verification itself fails.
-        if activate:
+        if activate or restore:
             try:
-                activate_schedule()
+                activate_schedule() if activate else activate_restored_units()
             except (Failure, OSError, ValueError, subprocess.SubprocessError):
                 print('⚠️ Расписание требует проверки: transitclient diagnose.', file=sys.stderr)
         raise
     if activate:
         activate_schedule()
+    elif restore:
+        activate_restored_units()
     return result
 
 
@@ -2540,6 +2607,9 @@ def _dispatch(args):
         verify_served(config, validate_certificate(config, chain, key))
         return 0
     with lifecycle_lock(wait=30 if getattr(args, 'worker', False) else 0):
+        if command in ('_recover', 'restore', 'install'):
+            if recover_restore() and command == '_recover' and not CONFIG.exists():
+                return 0
         if command in ('_recover', 'uninstall') and resume_uninstall():
             return 0
         # A waiting worker must use the settings committed by the previous owner.

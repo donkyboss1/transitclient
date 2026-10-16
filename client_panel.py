@@ -16,7 +16,6 @@ import unicodedata
 
 _ANSI = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]')
 _CONTAINER = re.compile(r'[a-f0-9]{12,64}')
-_NEXT_TIME = re.compile(r'[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: [A-Za-z0-9:+-]{1,16})?')
 
 
 def sanitize(value, limit=180):

@@ -1,5 +1,6 @@
 """Prepare the standalone public repository locally; never commits or uploads."""
 import argparse
+import hashlib
 from pathlib import Path
 import re
 import shutil
@@ -32,7 +33,11 @@ def prepare(destination):
     with tempfile.TemporaryDirectory(prefix='transitclient-release-') as temporary:
         candidate = Path(temporary) / bundle.name
         digest = build(candidate, root=root)
-        shutil.copyfile(candidate, bundle)
+        if bundle.exists() and hashlib.sha256(bundle.read_bytes()).hexdigest() != digest:
+            raise ValueError('Archive already exists with different contents; increment VERSION.')
+        if not bundle.exists():
+            with bundle.open('xb') as stream, candidate.open('rb') as source:
+                shutil.copyfileobj(source, stream)
         shutil.copyfile(candidate.with_name(candidate.name + '.sha256'), bundle.with_name(bundle.name + '.sha256'))
     # The public bootstrap is outside the bundle: its embedded hash cannot
     # become a circular dependency on its own bytes.

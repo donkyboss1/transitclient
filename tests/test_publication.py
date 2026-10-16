@@ -72,6 +72,18 @@ def test_publication_refreshes_this_repo_without_touching_git(publication_module
     assert digest in (root / 'install.sh').read_text(encoding='utf-8')
 
 
+def test_same_version_can_only_be_rebuilt_with_identical_contents(publication_module):
+    root = Path(publication_module.__file__).resolve().parent
+    bundle, digest = publication_module.prepare(root)
+    assert publication_module.prepare(root) == (bundle, digest)
+    paths = [bundle, bundle.with_name(bundle.name + '.sha256'), root / 'install.sh']
+    before = {path: path.read_bytes() for path in paths}
+    (root / 'README.md').write_text('changed sources without a version bump')
+    with pytest.raises(ValueError, match='increment VERSION'):
+        publication_module.prepare(root)
+    assert {path: path.read_bytes() for path in paths} == before
+
+
 def test_publication_pipe_uses_embedded_metadata(publication_module, tmp_path):
     executable = (Path('C:/Program Files/Git/bin/bash.exe') if os.name == 'nt'
                   else Path(shutil.which('bash') or '/nonexistent'))

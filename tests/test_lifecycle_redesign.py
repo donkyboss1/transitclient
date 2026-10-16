@@ -180,6 +180,46 @@ def test_rollback_restores_unit_files_and_enabled_state_without_restarting_worke
     assert ['systemctl', 'start', 'tenant-selfsteal-renew.service'] not in calls
 
 
+@pytest.mark.parametrize('current', ['recover.service', 'renew.service'])
+@pytest.mark.parametrize('active', [False, True])
+def test_rollback_does_not_stop_current_systemd_process(app, config, monkeypatch, current, active):
+    app.UNITS.mkdir()
+    app.atomic_json(app.CONFIG, config)
+    values = {}
+    for name in ('renew.service', 'renew.timer', 'recover.service'):
+        (app.UNITS / ('tenant-selfsteal-' + name)).write_text('new unit')
+        values[name] = dict(content='previous unit', enabled=True, active=active)
+    calls = []
+    def run(args, **_):
+        calls.append(args)
+        if args[:2] == ['systemctl', 'show']:
+            return result(output=b'current-invocation\n' if args[2] == 'tenant-selfsteal-' + current else b'other\n')
+        return result()
+    monkeypatch.setenv('INVOCATION_ID', 'current-invocation')
+    monkeypatch.setattr(app, 'run', run)
+    monkeypatch.setattr(app, 'check_install_resources', lambda: None)
+    app.restore_units(values)
+    assert not any('tenant-selfsteal-' + current in call and ('--now' in call or 'stop' in call) for call in calls)
+    if current == 'renew.service':
+        assert not any('tenant-selfsteal-recover.service' in call and ('--now' in call or 'stop' in call) for call in calls)
+    assert not any('tenant-selfsteal-renew.service' in call and 'start' in call for call in calls)
+    assert app.read_json(app.STATE / 'units-restore-pending.json') == values
+    app.activate_restored_units()
+    starts = [call for call in calls if call[:2] == ['systemctl', 'start']]
+    assert len(starts) == (2 if active else 0)
+    assert all('--no-block' in call for call in starts)
+
+
+def test_rollback_refuses_unknown_systemd_invocation_before_stopping_units(app, monkeypatch):
+    monkeypatch.setenv('INVOCATION_ID', 'unknown')
+    calls = []
+    monkeypatch.setattr(app, 'run', lambda args, **_: calls.append(args) or result(output=b'other\n'))
+    with pytest.raises(app.Failure) as error:
+        app.restore_units({})
+    assert error.value.code == 'SYSTEMD_STATE_UNKNOWN'
+    assert all(call[:2] == ['systemctl', 'show'] for call in calls)
+
+
 @pytest.mark.skipif(os.name != 'posix', reason='Real flock process contention requires Linux/WSL')
 def test_real_worker_lock_wait_is_bounded_and_releases_after_exception(app):
     program = 'import fcntl,sys,time; f=open(sys.argv[1],"a"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); time.sleep(1)'
@@ -212,8 +252,19 @@ def test_restore_rejects_foreign_or_tampered_backup_without_host_calls(app, conf
     assert not app.CONFIG.exists()
 
 
+@pytest.mark.parametrize('trusted_owner', [False, True])
 @pytest.mark.parametrize('domain', [None, 'new.example.com'])
-def test_explicit_restore_uses_trusted_runtime_and_never_requests_certificate(app, config, monkeypatch, domain):
+def test_explicit_restore_uses_trusted_runtime_and_never_requests_certificate(app, config, monkeypatch, domain, root_path, trusted_owner):
+    if not trusted_owner and os.name != 'posix':
+        pytest.skip('POSIX ownership check')
+    monkeypatch.setattr(app, 'Path', root_path)
+    if not trusted_owner:
+        stat = root_path.stat
+        def foreign_stat(path, *args, **kwargs):
+            value = stat(path, *args, **kwargs)
+            value.st_uid = 1000
+            return value
+        monkeypatch.setattr(root_path, 'stat', foreign_stat)
     source = app.STATE.parent / 'tenant-selfsteal-backup-test'
     source.mkdir(mode=0o700)
     config.update(install_id='b' * 32, firewall='preserve')
@@ -236,12 +287,109 @@ def test_explicit_restore_uses_trusted_runtime_and_never_requests_certificate(ap
     monkeypatch.setattr(app, 'confirm', lambda _: True)
     monkeypatch.setattr(app, 'run', lambda *_, **__: pytest.fail('Restore contacted CA/host'))
     before = (source / 'config-backup.json').read_bytes()
+    if not trusted_owner:
+        with pytest.raises(app.Failure, match='root') as error:
+            app.restore_backup(SimpleNamespace(backup=str(source), domain=domain, relay_ip=None))
+        assert error.value.code == 'BACKUP_UNTRUSTED'
+        assert not app.CONFIG.exists()
+        assert (source / 'config-backup.json').read_bytes() == before
+        return
     app.restore_backup(SimpleNamespace(backup=str(source), domain=domain, relay_ip=None))
     assert app.read_json(app.CONFIG)['domain'] == (domain or config['domain'])
     assert (app.STATE / 'acme/account.key').read_bytes() == b'original private account'
     assert not (app.STATE / 'recover.py').exists()
     assert (source / 'config-backup.json').read_bytes() == before
     assert app.read_json(app.STATE / 'lifecycle.json')['issuance_authorized'] is False
+
+
+@pytest.mark.parametrize('boundary', ['publish', 'config', 'lifecycle'])
+def test_interrupted_restore_publication_can_be_recovered_and_repeated(app, config, monkeypatch, root_path, boundary):
+    from contextlib import nullcontext
+    monkeypatch.setattr(app, 'Path', root_path)
+    source = app.STATE.parent / 'tenant-selfsteal-backup-test'
+    source.mkdir(mode=0o700)
+    config.update(install_id='b' * 32, firewall='preserve')
+    app.atomic_json(source / 'config-backup.json', config)
+    app.atomic_json(source / 'backup-manifest.json', dict(kind='transitclient-backup', install_id=config['install_id'],
+                    domain=config['domain'], config_sha256=hashlib.sha256((source / 'config-backup.json').read_bytes()).hexdigest()))
+    (source / 'acme').mkdir(mode=0o700)
+    (source / 'acme/account.key').write_bytes(b'test account')
+    (source / 'acme/account.key').chmod(0o600)
+    app.INSTALL.mkdir()
+    (app.INSTALL / 'selfsteal.py').write_text('retained trusted runtime')
+    (app.INSTALL / 'VERSION').write_text('1.5.0')
+    app.mark_package(config)
+    monkeypatch.setattr(app, 'PACKAGE', app.INSTALL)
+    for name in ('check_install_resources', 'check_dns', 'check_challenge_port', 'assert_local_docker',
+                 'dependencies', 'install_launcher', 'render_caddy', 'install_units'):
+        monkeypatch.setattr(app, name, lambda *_, **__: None)
+    monkeypatch.setattr(app, 'confirm', lambda _: True)
+    monkeypatch.setattr(app, 'run', lambda *_, **__: pytest.fail('Recovery contacted host/CA'))
+    atomic, replace = app.atomic_json, app.os.replace
+    def interrupted_write(path, value):
+        if boundary == 'config' and path == app.CONFIG or boundary == 'lifecycle' and path == app.STATE / 'lifecycle.json':
+            raise KeyboardInterrupt
+        atomic(path, value)
+    def interrupted_publish(old, new):
+        if boundary == 'publish' and new == app.STATE:
+            raise KeyboardInterrupt
+        replace(old, new)
+    monkeypatch.setattr(app, 'atomic_json', interrupted_write)
+    monkeypatch.setattr(app.os, 'replace', interrupted_publish)
+    args = SimpleNamespace(backup=str(source), domain=None)
+    with pytest.raises(KeyboardInterrupt):
+        app.restore_backup(args)
+    monkeypatch.setattr(app, 'atomic_json', atomic)
+    monkeypatch.setattr(app.os, 'replace', replace)
+    monkeypatch.setattr(app, 'require_host', lambda: None)
+    monkeypatch.setattr(app, 'lifecycle_lock', lambda **_: nullcontext())
+    assert app.dispatch(SimpleNamespace(command='_recover')) == 0
+    assert not app.CONFIG.exists()
+    assert not app.CONFIG.with_name('restore-transaction.json').exists()
+    assert (source / 'acme/account.key').read_bytes() == b'test account'
+    assert not app.recover_restore()
+    assert app.dispatch(SimpleNamespace(command='restore', backup=str(source), domain=None)) == 0
+    assert (app.STATE / 'acme/account.key').read_bytes() == b'test account'
+    assert app.read_json(app.CONFIG)['install_id'] == config['install_id']
+
+
+def test_restore_recovery_resumes_after_its_own_state_rename(app, config, monkeypatch):
+    identifier = 'a' * 32
+    marker = app.CONFIG.with_name('restore-transaction.json')
+    app.atomic_json(marker, {'id': identifier, 'config': config})
+    app.atomic_json(app.STATE / 'restore-publication.json', {'id': identifier})
+    app.atomic_json(app.CONFIG, config)
+    unlink = type(app.CONFIG).unlink
+    def interrupt(path, *args, **kwargs):
+        if path == app.CONFIG:
+            raise KeyboardInterrupt
+        return unlink(path, *args, **kwargs)
+    monkeypatch.setattr(type(app.CONFIG), 'unlink', interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        app.recover_restore()
+    assert not app.STATE.exists() and app.CONFIG.exists() and marker.exists()
+    monkeypatch.setattr(type(app.CONFIG), 'unlink', unlink)
+    assert app.recover_restore()
+    assert not app.CONFIG.exists() and not marker.exists()
+    saved = app.STATE.with_name('tenant-selfsteal-restore-interrupted-' + identifier)
+    assert app.read_json(saved / 'restore-publication.json') == {'id': identifier}
+
+
+def test_restore_recovery_preserves_changed_config_and_foreign_state(app, config):
+    identifier = 'a' * 32
+    app.atomic_json(app.CONFIG.with_name('restore-transaction.json'), {'id': identifier, 'config': config})
+    (app.STATE / 'foreign-file').write_bytes(b'preserve')
+    with pytest.raises(app.Failure) as error:
+        app.recover_restore()
+    assert error.value.code == 'RESTORE_RECOVERY_REQUIRED'
+    assert (app.STATE / 'foreign-file').read_bytes() == b'preserve'
+    (app.STATE / 'restore-publication.json').write_text('{"id": "' + identifier + '"}')
+    app.atomic_json(app.CONFIG, dict(config, domain='changed.example.com'))
+    with pytest.raises(app.Failure) as error:
+        app.recover_restore()
+    assert error.value.code == 'RESTORE_RECOVERY_REQUIRED'
+    assert app.read_json(app.CONFIG)['domain'] == 'changed.example.com'
+    assert (app.STATE / 'foreign-file').exists()
 
 
 def test_busy_worker_queues_one_retry_and_preserves_current_result(app, config, monkeypatch):
@@ -315,6 +463,27 @@ def test_service_recovery_never_starts_its_own_dependent_schedule(app, monkeypat
     assert app.dispatch(SimpleNamespace(command='_recover')) == 0
 
 
+@pytest.mark.parametrize('command', ['_recover', 'renew', 'template'])
+@pytest.mark.parametrize('failed', [False, True])
+def test_recovery_queues_restored_units_after_dispatch_even_on_failure(app, monkeypatch, command, failed):
+    monkeypatch.setenv('INVOCATION_ID', 'systemd-invocation')
+    events = []
+    def dispatch(_):
+        events.append('recovery-complete')
+        if failed:
+            raise app.Failure('after unit restoration')
+        return 0
+    monkeypatch.setattr(app, '_dispatch', dispatch)
+    monkeypatch.setattr(app, 'activate_restored_units', lambda: events.append('queue-restored'))
+    monkeypatch.setattr(app, 'activate_schedule', lambda: pytest.fail('Recovery waited on its dependent schedule'))
+    if failed:
+        with pytest.raises(app.Failure, match='after unit restoration'):
+            app.dispatch(SimpleNamespace(command=command))
+    else:
+        assert app.dispatch(SimpleNamespace(command=command)) == 0
+    assert events == ['recovery-complete', 'queue-restored']
+
+
 def test_firewall_mode_change_requires_confirmation_and_preserves_foreign_rules(app, config, monkeypatch):
     config['install_id'] = 'b' * 32
     app.atomic_json(app.CONFIG, config)
@@ -333,8 +502,7 @@ def test_firewall_mode_change_requires_confirmation_and_preserves_foreign_rules(
 
 @pytest.mark.parametrize('confirmed', [False, True])
 def test_hairpin_external_nonce_is_explicit_and_records_operator_scope(app, config, monkeypatch, confirmed):
-    from contextlib import nullcontext
-    monkeypatch.setattr(app, 'check_dns', lambda _: None)
+    monkeypatch.setattr(app, 'check_dns', lambda _: ['8.8.8.8'])
     monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
     monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
     monkeypatch.setattr(app, 'open_firewall', lambda _: None)
@@ -342,12 +510,20 @@ def test_hairpin_external_nonce_is_explicit_and_records_operator_scope(app, conf
     calls = []
     monkeypatch.setattr(app, 'run', lambda args, **_: calls.append(args) or result())
     class Response:
+        status = 200
+
         def read(self, *_):
             return b'wrong backend'
-    class Opener:
-        def open(self, *_args, **_kwargs):
-            return nullcontext(Response())
-    monkeypatch.setattr(app.urllib.request, 'build_opener', lambda *_: Opener())
+    class Connection:
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+    monkeypatch.setattr(app.http.client, 'HTTPConnection', lambda *_, **__: Connection())
     if confirmed:
         app.http_self_test(config, approved=True, external_check=True)
         record = app.read_json(app.STATE / 'http-path.json')
@@ -358,6 +534,52 @@ def test_hairpin_external_nonce_is_explicit_and_records_operator_scope(app, conf
         assert error.value.code == 'HTTP_PATH_UNCONFIRMED'
         assert not (app.STATE / 'http-path.json').exists()
     assert not any('acme.sh' in str(value) for call in calls for value in call)
+    assert not (app.STATE / 'operation.json').exists()
+
+
+@pytest.mark.parametrize('ipv6_result', ['ok', 'wrong_body', 'redirect', 'not_found', 'timeout'])
+def test_http_probe_checks_each_address_with_domain_host_and_cleans_up(app, config, monkeypatch, ipv6_result):
+    addresses = ['8.8.8.8', '2606:4700:4700::1111']
+    monkeypatch.setattr(app, 'check_dns', lambda _: addresses)
+    monkeypatch.setattr(app, 'check_challenge_port', lambda _: None)
+    monkeypatch.setattr(app, 'assert_transient_available', lambda _: None)
+    monkeypatch.setattr(app, 'open_firewall', lambda _: None)
+    monkeypatch.setattr(app, 'run', lambda *_, **__: result())
+    monkeypatch.setattr(app.time, 'sleep', lambda _: None)
+    events, requests = [], []
+    monkeypatch.setattr(app, 'stop_probe', lambda: events.append('stop-probe'))
+    class Connection:
+        def __init__(self, ip, port, timeout):
+            self.ip = ip
+            assert port == 80 and 0 < timeout <= 5
+
+        def request(self, method, path, headers):
+            assert method == 'GET' and headers['Host'] == config['domain']
+            self.nonce = path.rsplit('/', 1)[1]
+            requests.append(self.ip)
+            if self.ip == addresses[1] and ipv6_result == 'timeout':
+                raise TimeoutError
+
+        def getresponse(self):
+            outcome = ipv6_result if self.ip == addresses[1] else 'ok'
+            return SimpleNamespace(status={'redirect': 302, 'not_found': 404}.get(outcome, 200),
+                                   read=lambda _: b'wrong' if outcome == 'wrong_body' else ('transitclient-check:' + self.nonce).encode())
+
+        def close(self):
+            events.append('connection-closed')
+    monkeypatch.setattr(app.http.client, 'HTTPConnection', Connection)
+    if ipv6_result == 'ok':
+        app.http_self_test(config, approved=True)
+        record = app.read_json(app.STATE / 'http-path.json')
+        assert record['addresses'] == [dict(address=ip, confirmed=True) for ip in addresses]
+    else:
+        with pytest.raises(app.Failure) as error:
+            app.http_self_test(config, approved=True)
+        assert error.value.code == 'HTTP_PATH_UNCONFIRMED'
+        assert not (app.STATE / 'http-path.json').exists()
+    assert requests == addresses if ipv6_result != 'timeout' else requests == [addresses[0]] + [addresses[1]] * 5
+    assert events[-1] == 'stop-probe'
+    assert events.count('connection-closed') == len(requests)
     assert not (app.STATE / 'operation.json').exists()
 
 

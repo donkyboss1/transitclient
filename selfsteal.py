@@ -693,13 +693,20 @@ def open_firewall(config, identifier=None):
 
 
 def _open_firewall_locked(config, identifier):
-    if config.get('firewall_effective', config['firewall']) in ('manual', 'preserve'):
+    policy = config.get('firewall_effective') or config['firewall']
+    if policy in ('manual', 'preserve'):
         print(f"Внешний/local firewall: TCP {config['challenge_port']} должен пропускать "
               'все источники на время ACME. Автоматические правила не изменяются.')
         return
+    if policy != 'ufw':
+        raise Failure('Режим firewall ещё не подготовлен. Откройте transitclient → Настройки → Firewall.',
+                      'FIREWALL_MODE_REQUIRED')
     status = run(['ufw', 'status']).stdout.decode()
     if 'Status: active' not in status:
-        raise Failure('UFW не активен. Он не будет включён. Выберите manual осознанно.')
+        raise Failure('Сохранён режим управления UFW, но UFW не активен. '
+                      'Откройте transitclient → Настройки → Firewall: выберите preserve '
+                      'для сохранения текущих правил либо настройте UFW. Автоматически UFW не включён.',
+                      'UFW_INACTIVE')
     firewall = firewall_module()
     try:
         firewall.check_challenge_rules(run, config['challenge_port'])
@@ -1188,7 +1195,10 @@ def configure(config, choice=None, firewall_request=None):
 
 def renew(config):
     with operation_scope(config, 'renew'):
-        return _renew(config)
+        result = _renew(config)
+    import installation_flow
+    installation_flow.cleanup_previous_packages(SimpleNamespace(**globals()), config)
+    return result
 
 
 def _renew(config):
@@ -1626,9 +1636,9 @@ def install(args):
     retained_package = (not CONFIG.exists() or switching) and INSTALL.exists() and PACKAGE != INSTALL
     retained_marker = read_json(INSTALL / '.transitclient-package.json') if retained_package else None
     if retained_package:
-        print('📦 Сохранён собственный пакет ' + (INSTALL / 'VERSION').read_text().strip()
-              + '. После подтверждения будет установлен входящий пакет '
-              + (PACKAGE / 'VERSION').read_text().strip() + '; прежний пакет сохранится для отката.')
+        print('📦 Будет обновлён Transit Client: ' + (INSTALL / 'VERSION').read_text().strip()
+              + ' → ' + (PACKAGE / 'VERSION').read_text().strip() + '.')
+        print('Прежняя версия сохранится на время установки для восстановления.')
     diagnostics = diagnostic_module()
     initial_config = validate_config(read_json(CONFIG)) if CONFIG.exists() else None
     if switching and (STATE / 'certs/current').exists() and not (STATE / 'certs/current').is_symlink():
@@ -1640,8 +1650,15 @@ def install(args):
     import terminal_ui
     terminal = terminal_ui.Terminal(no_color=getattr(args, 'no_color', False))
     terminal.line('Режим установки', 'bold')
-    for number, label in [('1', '🚀 Установить Caddy'), ('2', '📖 Свой веб-сервер'), ('0', '⬅️ Выход')]:
-        terminal.fragments(terminal_ui.option(number, label))
+    for number, label in [('1', '🚀 Установить веб-сервер Caddy [Рекомендуем]'),
+                          ('2', '📖 Свой веб-сервер [Инструкция]'), ('0', '⬅️ Выход')]:
+        values = terminal_ui.option(number, label)
+        if ' [' in label and sum(terminal_ui.display_width(value) for value, _ in values) > terminal.width:
+            title, tag = label.rsplit(' ', 1)
+            terminal.fragments(terminal_ui.option(number, title))
+            terminal.line('      ' + tag)
+        else:
+            terminal.fragments(values)
     mode = ask('Режим', '1')
     if mode == '2':
         guide(None)
@@ -1677,7 +1694,11 @@ def install(args):
                 raise Failure('Домен совпадает с текущим. Используйте меню управления.', 'DOMAIN_UNCHANGED')
             config['install_id'] = initial_config['install_id']
             config['firewall'] = initial_config['firewall']
-            config['firewall_effective'] = initial_config.get('firewall_effective')
+            policy = initial_config.get('firewall_effective') or initial_config['firewall']
+            config['firewall_effective'] = 'preserve' if policy == 'manual' else policy
+            if config['firewall_effective'] not in ('ufw', 'preserve'):
+                raise Failure('Сначала выберите режим в transitclient → Настройки → Firewall.',
+                              'FIREWALL_MODE_REQUIRED')
             config['ca'] = initial_config['ca']
             config['staging_ca_file'] = initial_config.get('staging_ca_file')
         report = diagnostics.collect(config)
@@ -1707,7 +1728,7 @@ def install(args):
             raise Failure('Подготовка отменена.', 'CANCELLED')
     firewall = firewall_module()
     try:
-        firewall_plan = ({'changes': [], 'effective': initial_config.get('firewall_effective')}
+        firewall_plan = ({'changes': [], 'effective': config['firewall_effective']}
                          if switching else firewall.plan(config, report, run))
     except firewall.FirewallError as exc:
         raise Failure(str(exc), exc.code) from exc
@@ -1845,6 +1866,7 @@ def install(args):
     if switching:
         print('✅ Новый домен настроен: ' + config['domain'])
         print('Проверьте новый домен/SNI и target в VPN-ноде. Правила постоянного firewall сохранены.')
+        installation_flow.cleanup_previous_packages(SimpleNamespace(**globals()), config)
         try:
             installation_flow.cleanup_old_data(SimpleNamespace(**globals()), config)
         except (KeyboardInterrupt, EOFError):
@@ -1895,7 +1917,7 @@ def saved_status(config):
         report['installation']['lifecycle'] = read_json(STATE / 'lifecycle.json')
     if config:
         report['installation']['firewall_requested'] = config['firewall']
-        report['installation']['firewall_effective'] = config.get('firewall_effective', config['firewall'])
+        report['installation']['firewall_effective'] = config.get('firewall_effective') or config['firewall']
     report['pending'] = [name for name in ('firewall.json', 'ufw-activation.json', 'certificate-transaction.json',
                          'configuration-transaction.json', 'update-transaction.json', 'site-transaction.json',
                          'operation.json', 'uninstall.json', 'schedule-pending.json') if (STATE / name).exists()]

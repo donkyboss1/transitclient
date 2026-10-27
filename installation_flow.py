@@ -134,6 +134,74 @@ def verified_backup(app, path):
     return config
 
 
+def previous_package(app, path, config):
+    path = Path(path)
+    match = re.fullmatch(r'tenant-selfsteal\.previous-([0-9a-f]{32})', path.name)
+    if (not match or path.is_symlink() or path.parent.resolve() != app.INSTALL.parent.resolve()
+            or path.resolve() == app.INSTALL.resolve()):
+        raise app.Failure('Путь прежней версии не подтверждён.', 'BACKUP_UNTRUSTED')
+    safe_tree(app, path, private=False)
+    root_files = {'selfsteal.sh', 'VERSION', 'dependencies.json', 'templates.json', 'README.md',
+                  'LICENSE', 'NOTICE.md', '.transitclient-package.json'}
+    root_dirs = {'vendor', 'site', 'docs', 'tests', '__pycache__'}
+    if any((item.is_dir() and item.name not in root_dirs)
+           or (item.is_file() and item.name not in root_files and item.suffix != '.py')
+           for item in path.iterdir()):
+        raise app.Failure('В прежней версии есть неизвестные файлы.', 'BACKUP_UNTRUSTED')
+    marker = app.read_json(path / '.transitclient-package.json')
+    if (not re.fullmatch(r'[0-9a-f]{32}', marker.get('install_id', ''))
+            or marker.get('version') != (path / 'VERSION').read_text().strip()
+            or marker.get('controller_sha256') != hashlib.sha256((path / 'selfsteal.py').read_bytes()).hexdigest()):
+        raise app.Failure('Принадлежность прежней версии не подтверждена.', 'BACKUP_UNTRUSTED')
+    snapshot = app.STATE / ('update-backup-' + match[1])
+    if snapshot.is_symlink():
+        raise app.Failure('Путь служебной копии не подтверждён.', 'BACKUP_UNTRUSTED')
+    if snapshot.exists():
+        safe_tree(app, snapshot, private=False)
+        allowed = {'Caddyfile', 'compose.yaml', 'docker-compose', 'recover.py', 'diagnostics.py',
+                   'site_templates.py', 'firewall_setup.py', 'recovery-current.json', 'schedule-pending.json',
+                   'units.json', 'config.json'}
+        if (any(not item.is_file() or item.name not in allowed for item in snapshot.iterdir())
+                or app.read_json(snapshot / 'config.json').get('install_id')
+                not in (config['install_id'], marker['install_id'])):
+            raise app.Failure('Состав служебной копии не подтверждён.', 'BACKUP_UNTRUSTED')
+    return marker, snapshot
+
+
+def cleanup_previous_packages(app, config):
+    """Discard only proven runtime backups after successful TLS and transaction commit."""
+    try:
+        if (not app.CONFIG.exists() or app.read_json(app.CONFIG) != config or not app.package_owned()
+                or app.read_json(app.INSTALL / '.transitclient-package.json').get('install_id') != config.get('install_id')
+                or not (app.STATE / 'lifecycle.json').exists()
+                or app.read_json(app.STATE / 'lifecycle.json').get('stage') != 'ready'
+                or any((app.STATE / name).exists() for name in (
+                    'operation.json', 'configuration-transaction.json', 'certificate-transaction.json',
+                    'update-transaction.json', 'uninstall.json', 'ufw-activation.json'))):
+            return
+        removed = skipped = 0
+        for path in sorted(app.INSTALL.parent.glob('tenant-selfsteal.previous-*')):
+            try:
+                marker, snapshot = previous_package(app, path, config)
+                # Keep recovery generations and installation/certificate backups intact.
+                if snapshot.exists():
+                    if snapshot.resolve().parent != app.STATE.resolve():
+                        raise app.Failure('Путь служебной копии изменился.', 'BACKUP_UNTRUSTED')
+                    shutil.rmtree(snapshot)
+                if previous_package(app, path, config)[0] != marker:
+                    raise app.Failure('Прежняя версия изменилась.', 'BACKUP_UNTRUSTED')
+                shutil.rmtree(path)
+                removed += 1
+            except (OSError, ValueError, KeyError, TypeError, app.Failure):
+                skipped += 1
+        if removed:
+            print('Удалены временные резервные файлы прежних версий Transit Client.')
+        if skipped:
+            print('⚠️ Неподтверждённые резервные файлы программы сохранены для ручной проверки.')
+    except (OSError, ValueError, KeyError, TypeError, app.Failure):
+        print('⚠️ Очистка прежних версий не завершена. Рабочая установка сохранена.')
+
+
 def cleanup_old_data(app, config):
     """Called interactively only after the new domain's served TLS was verified."""
     if app.read_json(app.CONFIG) != config:

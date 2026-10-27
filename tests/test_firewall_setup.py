@@ -193,8 +193,11 @@ def test_fail2ban_reports_specific_cause_before_any_mutation(fw, config, report,
     assert not any(a[0] in ('ufw', 'systemd-run', 'apt-get') and a[1:2] != ['status'] for a in run.calls)
 
 
-def test_manual_mode_never_reads_or_changes_existing_fail2ban(fw, config, report, tmp_path):
+@pytest.mark.parametrize('null_effective', [False, True])
+def test_manual_mode_never_reads_or_changes_existing_fail2ban(fw, config, report, tmp_path, null_effective):
     config['firewall'] = 'manual'
+    if null_effective:
+        config['firewall_effective'] = None
     def unchanged(*_, **__):
         pytest.fail('Manual mode must not inspect, enable or change the host firewall')
     prepared = fw.plan(config, report, unchanged)

@@ -238,7 +238,7 @@ def check_challenge_rules(run, port, *, check_vendor=True):
 
 def plan(config, report, run):
     """Read-only JSON-serializable activation plan; raise for uncertain safety."""
-    requested = config.get('firewall_effective', config.get('firewall', 'auto'))
+    requested = config.get('firewall_effective') or config.get('firewall', 'auto')
     if requested in ('manual', 'preserve'):
         return dict(mode=requested, effective='preserve', rules=[], changes=[
                     'Сохранить существующий firewall; временные разрешения также настраиваются владельцем.'], fingerprint=requested)

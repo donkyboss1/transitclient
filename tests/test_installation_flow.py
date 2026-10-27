@@ -115,6 +115,8 @@ def test_new_domain_uses_incoming_package_and_commits_before_cleanup(app, switch
     assert cleanup == ['new.example.com']
     assert not (app.STATE / 'configuration-transaction.json').exists()
     assert (app.INSTALL / 'VERSION').read_text() == '1.4.1'
+    assert not list(app.INSTALL.parent.glob('tenant-selfsteal.previous-*'))
+    assert not list(app.STATE.glob('update-backup-*'))
     backups = list(app.STATE.parent.glob('tenant-selfsteal-backup-*'))
     assert len(backups) == 1 and flow.verified_backup(app, backups[0]) == old
     assert (backups[0] / 'certs' / ('b' * 32) / 'key.pem').exists()
@@ -140,6 +142,8 @@ def test_failed_new_domain_restores_old_configuration_certificate_and_metadata(a
     assert app.read_json(app.STATE / 'http-path.json') == {'old': True}
     assert not (app.STATE / 'configuration-transaction.json').exists()
     assert cleanup == []
+    if stage in ('http_self_test', 'renew'):
+        assert list(app.INSTALL.parent.glob('tenant-selfsteal.previous-*'))
 
 
 def test_cancel_new_domain_has_no_backup_or_mutations(app, switching, monkeypatch):

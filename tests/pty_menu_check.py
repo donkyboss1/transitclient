@@ -772,6 +772,10 @@ def vertical_install_modes():
                 raw = current_screen(session)
                 plain = CSI.sub('', raw).replace('\r', '')
                 assert 'Режим установки' in plain, plain
+                # The recommended label may wrap on the narrow terminal.
+                compact = ''.join(plain.split())
+                assert 'Установитьвеб-серверCaddy[Рекомендуем]' in compact, plain
+                assert 'Свойвеб-сервер[Инструкция]' in compact, plain
                 options = [line for line in plain.splitlines() if re.match(r'^\s*[120]\)', line)]
                 assert [re.match(r'^\s*([120])\)', line).group(1) for line in options] == ['1', '2', '0'], plain
                 for number in ('1', '2', '0'):

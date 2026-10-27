@@ -623,8 +623,9 @@ def test_install_mode_menu_is_vertical_with_bold_title_and_numbers(app, ui, monk
     plain = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', raw)
     options = [line for line in plain.splitlines() if re.match(r'^\s*[120]\)', line)]
     assert [re.match(r'^\s*([120])\)', line).group(1) for line in options] == ['1', '2', '0'], plain
-    assert any('Установить Caddy' in line for line in options)
+    assert any('Установить веб-сервер Caddy' in line for line in options)
     assert any('Свой веб-сервер' in line for line in options)
+    assert '[Рекомендуем]' in plain and '[Инструкция]' in plain
     assert re.search(r'\x1b\[1(?:;\d+)?m[^\n]*Режим установки', raw), raw
     for number in ('1', '2', '0'):
         assert re.search(r'\x1b\[1m\s*' + number + r'\x1b\[0m\)', raw), raw

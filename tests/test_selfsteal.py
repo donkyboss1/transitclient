@@ -261,8 +261,9 @@ def test_no_ufw_enable_or_manual_rule_mutation(app, config, monkeypatch):
     calls = []
     monkeypatch.setattr(app, 'run', lambda args, **kwargs: calls.append(args) or result(output=b'Status: inactive'))
     monkeypatch.setattr(app, 'check_challenge_port', lambda c: None)
-    with pytest.raises(app.Failure, match='не будет включён'):
+    with pytest.raises(app.Failure) as error:
         app.open_firewall(config)
+    assert error.value.code == 'UFW_INACTIVE'
     config['firewall'] = 'manual'
     app.open_firewall(config)
     assert calls == [['ufw', 'status']]

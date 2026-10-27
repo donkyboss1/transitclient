@@ -1019,6 +1019,50 @@ def acme_command(config, *args):
             '--config-home', STATE / 'acme', '--server', config['ca'], *args]
 
 
+def acme_failure(result):
+    """Classify captured ACME output without echoing responses, hooks or secrets."""
+    output = ((getattr(result, 'stdout', b'') or b'') +
+              (getattr(result, 'stderr', b'') or b'')).decode('utf-8', errors='replace').lower()
+    for patterns, code, message in (
+        (('urn:ietf:params:acme:error:ratelimited', 'too many certificates', 'too many failed authorizations'),
+         'ACME_RATE_LIMITED', 'CA ограничил число запросов. Не повторяйте выпуск до окончания ограничения.'),
+        (('account key has been deactivated', 'account key not found', 'urn:ietf:params:acme:error:accountdoesnotexist'),
+         'ACME_ACCOUNT_ERROR', 'Требуется проверка сохранённого ACME-аккаунта и его ключа.'),
+        (('urn:ietf:params:acme:error:caa', 'caa record'),
+         'ACME_CAA_ERROR', 'CA не разрешён CAA-записями домена.'),
+        (('urn:ietf:params:acme:error:dns', 'dns problem:'),
+         'ACME_DNS_ERROR', 'CA не смог проверить DNS домена.'),
+        (('urn:ietf:params:acme:error:connection', 'invalid response from http://'),
+         'ACME_HTTP_ERROR', 'CA не получил правильный HTTP-01 ответ через relay на проверочный порт backend.'),
+        (('urn:ietf:params:acme:error:unauthorized', 'verification error'),
+         'ACME_VALIDATION_FAILED', 'CA не подтвердил владение доменом. Проверьте внешний HTTP-01 путь и DNS.'),
+        (('address already in use', 'can not listen for user'),
+         'ACME_LISTENER_ERROR', 'ACME-клиент не смог запустить проверочный слушатель.'),
+        (('please install socat or python', 'please install openssl first', 'we need openssl'),
+         'ACME_TOOL_MISSING', 'В окружении ACME-службы отсутствует необходимый инструмент.'),
+        (('[operation_expired]', '[ownership_unknown]', 'error occurred when running pre hook'),
+         'ACME_PRE_HOOK_FAILED', 'Не выполнена локальная подготовка перед ACME. Проверьте состояние операции и доступность проверочного порта.'),
+        (('error encountered while running post hook', 'error encountered while running renew hook'),
+         'ACME_POST_HOOK_FAILED', 'Не завершён локальный обработчик ACME. Требуется проверка состояния операции.'),
+        (('key creation error', 'error creating domain key', 'error creating account key',
+          'error creating csr', 'could not read private key', 'sign failed:', 'cannot read key length'),
+         'ACME_KEY_ERROR', 'Не удалось создать или использовать ключ. Сохранённые ключи не удаляйте и не заменяйте.'),
+        (('ssl certificate problem', 'certificate verify failed'),
+         'ACME_API_TLS_ERROR', 'ACME-клиент не подтвердил TLS API CA. Проверьте время и системное хранилище доверия.'),
+        (('cannot get eab credentials', 'using zerossl as default ca'),
+         'ACME_CA_CONFIGURATION', 'Требуется проверка выбранного CA и сохранённых настроек ACME-аккаунта.'),
+        (('error registering account', 'cannot register account', 'cannot determine the acme account url'),
+         'ACME_REGISTRATION_FAILED', 'Не удалось зарегистрировать или определить сохранённый ACME-аккаунт.'),
+        (('cannot init api', 'cannot connect to', 'cannot make post request', 'cannot fetch acme directory'),
+         'ACME_API_ERROR', 'ACME-клиент не завершил запрос к API CA.'),
+        (('permission denied', 'no such file or directory', 'failed at step'),
+         'ACME_PROCESS_ERROR', 'Не удалось выполнить ACME-клиент либо получить доступ к его файлам.'),
+    ):
+        if any(pattern in output for pattern in patterns):
+            return code, message
+    return 'ACME_CLIENT_FAILED', 'Причина отказа ACME-клиента не распознана. Сырые ответы и реквизиты автоматически не выводятся.'
+
+
 def synchronize_acme_parameters(config, pre, post):
     """acme.sh 3.1.6 renew sources saved domain config over CLI hook/port args.
 
@@ -1255,9 +1299,8 @@ def _renew(config):
         # acme.sh's documented RENEW_SKIP=2 is not a CA error. It runs the
         # pre-hook AFTER its due/ARI checks, so skipped runs never open firewall.
         if result.returncode not in (0, 2):
-            raise Failure('ACME-проверка не завершена. Проверьте маршрут в боте, '
-                          'DNS и входящий проверочный порт в firewall/NAT. '
-                          'Прежний сертификат сохранён; повтор через таймер.')
+            code, reason = acme_failure(result)
+            raise Failure('ACME-проверка не завершена. ' + reason + ' Прежний сертификат сохранён.', code)
         if result.returncode == 2:
             print('Срок продления ещё не наступил. Используется имеющийся сертификат.')
         chain = domain_dir / 'fullchain.cer'

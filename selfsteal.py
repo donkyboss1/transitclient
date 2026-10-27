@@ -2128,7 +2128,8 @@ def _http_self_test(config, *, approved=False, external_check=False):
         results = []
         for ip in addresses:
             confirmed = False
-            for _ in range(5):
+            last_failure = 'не получен ответ'
+            for attempt in range(5):
                 remaining = 120 - (time.monotonic() - started)
                 if remaining <= 0:
                     break
@@ -2138,11 +2139,22 @@ def _http_self_test(config, *, approved=False, external_check=False):
                                        headers={'Host': config['domain'], 'Connection': 'close'})
                     upstream = connection.getresponse()
                     confirmed = upstream.status == 200 and upstream.read(128) == ('transitclient-check:' + token).encode()
-                    break
-                except (OSError, http.client.HTTPException):
-                    time.sleep(min(1, max(0, 120 - (time.monotonic() - started))))
+                    last_failure = ('HTTP 200: неверный контрольный ответ' if upstream.status == 200
+                                    else f'HTTP {upstream.status}')
+                    # systemd exec readiness precedes Python binding the listener.
+                    if confirmed or upstream.status not in (502, 503, 504):
+                        break
+                except (OSError, http.client.HTTPException) as exc:
+                    last_failure = ('таймаут' if isinstance(exc, TimeoutError) else
+                                    'отказ в соединении' if isinstance(exc, ConnectionRefusedError) else
+                                    'ошибка сети' if isinstance(exc, OSError) else 'ошибка HTTP')
                 finally:
                     connection.close()
+                pause = min(1, max(0, 120 - (time.monotonic() - started)))
+                if attempt < 4 and pause > 0:
+                    time.sleep(pause)
+            if not confirmed:
+                print(f'⚠️ Проверка {ip}:80: {last_failure}.')
             results.append(dict(address=ip, confirmed=confirmed))
         if not results or not all(row['confirmed'] for row in results):
             if not external_check:

@@ -139,6 +139,8 @@ def safe_extract(archive_path, destination, version, digest):
         required.update({'client_panel.py', 'terminal_ui.py'})
     if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 5, 0):
         required.add('renewal_schedule.py')
+    if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 5, 2):
+        required.add('installation_flow.py')
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0
         for entry in archive:

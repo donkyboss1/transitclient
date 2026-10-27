@@ -216,6 +216,9 @@ def child(scenario, no_color):
             app.diagnostic_module = lambda: SimpleNamespace(collect=lambda *_: {'checks': []},
                                                             display_compact=lambda *_, **__: None)
             app.guide = lambda *_: print('MODE_GUIDE', flush=True)
+        if scenario == 'existing-install':
+            app.atomic_json(app.CONFIG, config)
+            app.certificate_status = lambda _: dict(state='present', days_remaining=75)
 
         def fake_perform(args):
             command = args.command
@@ -249,6 +252,10 @@ def child(scenario, no_color):
                 for index in range(75):
                     print('REPORT_LINE=' + str(index), flush=True)
             if command == 'install':
+                if scenario == 'existing-install':
+                    import installation_flow
+                    print('EXISTING_CHOICE=' + installation_flow.choose_existing(app, args), flush=True)
+                    return 0
                 if scenario == 'install-mode':
                     try:
                         real_install(args)
@@ -779,6 +786,25 @@ def vertical_install_modes():
                 session.finish()
 
 
+def existing_install_choices():
+    for columns, lines in ((80, 40), (48, 20)):
+        for choice in ('0', '1', '2'):
+            with Session('existing-install', columns=columns, lines=lines) as session:
+                session.send('1\n')
+                session.expect('Найдена установка Transit Client')
+                session.expect('Выберите действие [0]:')
+                raw = current_screen(session)
+                assert 'Настроить новый домен из бота' in CSI.sub('', raw)
+                assert 'DNS_LOOKUP_FAILED' not in session.output
+                session.send(choice + '\n')
+                session.expect('EXISTING_CHOICE=' + choice)
+                session.expect(PAUSE)
+                session.send('\n')
+                session.expect(PROMPT)
+                session.send('0\n')
+                session.finish()
+
+
 def streaming_vs16_edge_and_buffer_order():
     for columns, lines in ((80, 40), (48, 20)):
         for scenario in ('vs16-edge', 'vs16-buffered'):
@@ -817,7 +843,7 @@ def main():
               input_cancel_and_operation_interrupt, eof_at_every_level,
               confirmation_defaults_to_no, terminal_capabilities_and_layout, redirected_output,
               shared_headers_direct_docker_and_operation_regions, operation_stream_and_long_report,
-              narrow_vs16_cursor_cells, vertical_install_modes, streaming_vs16_edge_and_buffer_order]
+              narrow_vs16_cursor_cells, vertical_install_modes, existing_install_choices, streaming_vs16_edge_and_buffer_order]
     for check in checks:
         check()
         print('PASS ' + check.__name__, flush=True)

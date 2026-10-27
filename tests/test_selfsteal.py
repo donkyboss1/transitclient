@@ -1381,6 +1381,7 @@ def test_perform_eof_propagates_without_error_history(app, config, monkeypatch):
 
 def test_declined_action_has_no_failure_history(app, config, monkeypatch, capsys):
     app.atomic_json(app.CONFIG, config)
+    monkeypatch.setattr(app, 'ask', lambda *_: '1')
     def dispatch(_):
         raise app.Failure('Установка отменена', 'CANCELLED')
     monkeypatch.setattr(app, 'dispatch', dispatch)

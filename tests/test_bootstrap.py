@@ -138,6 +138,12 @@ def test_archive_resource_limits(extractor, tmp_path, limit):
     args = release(tmp_path)
     with pytest.raises(ValueError):
         extractor[0](*args)
+
+
+def test_repeat_install_module_required_since_152(extractor, tmp_path):
+    args = release(tmp_path, version='1.5.2', omit=['installation_flow.py'])
+    with pytest.raises(ValueError):
+        extractor[0](*args)
     assert not args[1].exists()
 
 

@@ -6,9 +6,9 @@ set -euo pipefail
 umask 077
 
 # Publication fills these three values together. Never guess a repository URL.
-RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.5.1.tar.gz'
-RELEASE_VERSION='1.5.1'
-RELEASE_SHA256='8d0a964175d86b925a2f33dd566d3547ed56845148020007767bf3c83844c5a8'
+RELEASE_URL='https://raw.githubusercontent.com/donkyboss1/transitclient/main/dist/transitclient-1.5.2.tar.gz'
+RELEASE_VERSION='1.5.2'
+RELEASE_SHA256='1fff88a22538d05b439c8de3e4ac56489665588fcb6f5c30aad308bf2f8b9d0e'
 
 fail() { printf '\n❌ %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -139,6 +139,8 @@ def safe_extract(archive_path, destination, version, digest):
         required.update({'client_panel.py', 'terminal_ui.py'})
     if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 5, 0):
         required.add('renewal_schedule.py')
+    if tuple(int(part) for part in version.split('-', 1)[0].split('+', 1)[0].split('.')) >= (1, 5, 2):
+        required.add('installation_flow.py')
     with tarfile.open(archive_path, 'r:gz') as archive:
         entries, names, total = [], set(), 0
         for entry in archive:

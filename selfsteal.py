@@ -780,7 +780,9 @@ def recover_update():
         compose('up', '-d', '--no-build', 'caddy')
         reload_caddy()
         config = validate_config(read_json(CONFIG))
-        verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem'))
+        domain_journal = STATE / 'configuration-transaction.json'
+        if not domain_journal.exists() or not read_json(domain_journal).get('domain_switch'):
+            verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem'))
     journal.unlink()
 
 
@@ -1043,7 +1045,26 @@ def recover_configuration():
     previous = read_json(journal)
     config = validate_config(previous['config'])
     for name in ('Caddyfile', 'compose.yaml'):
-        (STATE / name).write_text(previous[name], encoding='utf-8')
+        if previous[name] is None:
+            (STATE / name).unlink(missing_ok=True)
+        else:
+            (STATE / name).write_text(previous[name], encoding='utf-8')
+    if previous.get('domain_switch'):
+        old = previous['certificate']
+        if old is not None:
+            if not re.fullmatch(r'[0-9a-f]{32}', old):
+                raise Failure('Журнал смены домена повреждён.', 'RECOVERY_INVALID')
+            swap_current(old)
+        else:
+            compose('down', check=False)
+            (STATE / 'certs/current').unlink(missing_ok=True)
+        for name, value in previous['metadata'].items():
+            if name not in ('lifecycle.json', 'http-path.json', 'result.json', 'schedule-pending.json'):
+                raise Failure('Неизвестные данные в журнале смены домена.', 'RECOVERY_INVALID')
+            if value is None:
+                (STATE / name).unlink(missing_ok=True)
+            else:
+                atomic_json(STATE / name, value)
     if previous.get('units'):
         for name, content in previous['units'].items():
             if name not in ('renew.service', 'renew.timer', 'recover.service'):
@@ -1054,8 +1075,9 @@ def recover_configuration():
         compose('up', '-d', '--no-build', 'caddy')
         atomic_json(CONFIG, config)
         reload_caddy()
-        verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem',
-                                                    STATE / 'certs/current/key.pem'))
+        if not previous.get('domain_switch'):
+            verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem',
+                                                        STATE / 'certs/current/key.pem'))
     else:
         atomic_json(CONFIG, config)
     journal.unlink()
@@ -1600,7 +1622,8 @@ def install(args):
     if (STATE / 'update-transaction.json').exists():
         raise Failure('Замена пакета не завершена. Сначала выполните '
                       'sudo python3 /var/lib/tenant-selfsteal/recover.py _recover.', 'UPDATE_RECOVERY_REQUIRED')
-    retained_package = not CONFIG.exists() and INSTALL.exists() and PACKAGE != INSTALL
+    switching = getattr(args, '_new_domain', False)
+    retained_package = (not CONFIG.exists() or switching) and INSTALL.exists() and PACKAGE != INSTALL
     retained_marker = read_json(INSTALL / '.transitclient-package.json') if retained_package else None
     if retained_package:
         print('📦 Сохранён собственный пакет ' + (INSTALL / 'VERSION').read_text().strip()
@@ -1608,7 +1631,11 @@ def install(args):
               + (PACKAGE / 'VERSION').read_text().strip() + '; прежний пакет сохранится для отката.')
     diagnostics = diagnostic_module()
     initial_config = validate_config(read_json(CONFIG)) if CONFIG.exists() else None
-    initial_report = diagnostics.collect(initial_config)
+    if switching and (STATE / 'certs/current').exists() and not (STATE / 'certs/current').is_symlink():
+        raise Failure('Неизвестный формат текущего сертификата; требуется ручная сверка.', 'OWNERSHIP_UNKNOWN')
+    # An obsolete domain must not fail DNS before the user selects the new one.
+    initial_report = diagnostics.collect({key: value for key, value in (initial_config or {}).items()
+                                          if key != 'domain'} if switching else initial_config)
     diagnostics.display_compact(initial_report)
     import terminal_ui
     terminal = terminal_ui.Terminal(no_color=getattr(args, 'no_color', False))
@@ -1621,7 +1648,7 @@ def install(args):
         return
     if mode != '1':
         raise Failure('Установка отменена.', 'CANCELLED')
-    if CONFIG.exists():
+    if CONFIG.exists() and not switching:
         if (STATE / 'ufw-activation.json').exists():
             raise Failure('Незавершённая настройка UFW. Выполните sudo transitclient _recover, '
                           'затем повторите установку.', 'FIREWALL_RECOVERY_REQUIRED')
@@ -1636,12 +1663,29 @@ def install(args):
                               'с архивом, версией и доверенным SHA256; данные не перезаписаны.', 'UPDATE_REQUIRED')
             PACKAGE = INSTALL
     else:
-        config = interactive_config(args)
+        defaults = SimpleNamespace(**vars(args))
+        if switching:
+            if not initial_config.get('install_id'):
+                raise Failure('Сначала обновите прежнюю установку штатной командой update.', 'OWNERSHIP_UNKNOWN')
+            for name in ('vpn_port', 'challenge_port', 'local_port', 'docker_network', 'vpn_container', 'firewall'):
+                if not getattr(defaults, name, None):
+                    setattr(defaults, name, initial_config.get(name))
+            defaults.staging_ca_file = initial_config.get('staging_ca_file')
+        config = interactive_config(defaults)
+        if switching:
+            if config['domain'] == initial_config['domain']:
+                raise Failure('Домен совпадает с текущим. Используйте меню управления.', 'DOMAIN_UNCHANGED')
+            config['install_id'] = initial_config['install_id']
+            config['firewall'] = initial_config['firewall']
+            config['firewall_effective'] = initial_config.get('firewall_effective')
+            config['ca'] = initial_config['ca']
+            config['staging_ca_file'] = initial_config.get('staging_ca_file')
         report = diagnostics.collect(config)
         detect_vpn_network(config, report)
         check_dns(config)
         check_challenge_port(config)
-        if not config.get('docker_network') and not free_port(config['local_port'], '127.0.0.1'):
+        if (not config.get('docker_network') and not (switching and config['local_port'] == initial_config['local_port'])
+                and not free_port(config['local_port'], '127.0.0.1')):
             raise Failure('Локальный HTTPS-порт занят; выберите другой, не останавливая процесс.', 'HTTPS_PORT_BUSY')
     report = diagnostics.collect(config)
     diagnostics.display_compact(report, ports=True)
@@ -1663,42 +1707,59 @@ def install(args):
             raise Failure('Подготовка отменена.', 'CANCELLED')
     firewall = firewall_module()
     try:
-        firewall_plan = firewall.plan(config, report, run)
+        firewall_plan = ({'changes': [], 'effective': initial_config.get('firewall_effective')}
+                         if switching else firewall.plan(config, report, run))
     except firewall.FirewallError as exc:
         raise Failure(str(exc), exc.code) from exc
     for change in firewall_plan['changes']:
         print('🛡️ ' + change)
     chosen_template = None
-    if not CONFIG.exists() or getattr(args, 'template', None) is not None:
+    if not switching and (not CONFIG.exists() or getattr(args, 'template', None) is not None):
         chosen_template = select_template(getattr(args, 'template', None) or 'random')
         print('🎨 Выбранный сайт: ' + chosen_template)
+    if switching:
+        print('Прежний домен: ' + initial_config['domain'] + ' → новый: ' + config['domain'])
+        print('Сайт, ACME-аккаунт и постоянные правила firewall сохраняются. '
+              'При смене портов согласуйте доступ в firewall и настройки VPN-ноды.')
     if not installation_plan(config):
         raise Failure('Установка отменена.', 'CANCELLED')
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    STATE.chmod(0o700)
-    config.setdefault('install_id', uuid.uuid4().hex)
-    config['firewall_effective'] = firewall_plan.get('effective', 'preserve' if config['firewall'] == 'manual' else config['firewall'])
-    if not CONFIG.exists():
-        if config['ca'] == STAGING:
-            trust = STATE / 'staging-trust.pem'
-            shutil.copyfile(config['staging_ca_file'], trust)
-            trust.chmod(0o600)
-            config['staging_ca_file'] = str(trust)
-        atomic_json(CONFIG, config)
-    else:
-        previous = read_json(CONFIG)
-        if not (STATE / 'legacy-config-backup.json').exists():
-            atomic_json(STATE / 'legacy-config-backup.json', previous)
-        if all((STATE / name).exists() for name in ('Caddyfile', 'compose.yaml')):
-            atomic_json(STATE / 'configuration-transaction.json', {'config': previous,
-                        **{name: (STATE / name).read_text() for name in ('Caddyfile', 'compose.yaml')},
-                        'units': {name: (UNITS / ('tenant-selfsteal-' + name)).read_text()
-                                  for name in ('renew.service', 'renew.timer', 'recover.service')
-                                  if (UNITS / ('tenant-selfsteal-' + name)).exists()}})
-        atomic_json(CONFIG, config)
-    lifecycle_stage('preparing', issuance_authorized=True)
+    if switching:
+        import installation_flow
+        installation_flow.backup_installation(SimpleNamespace(**globals()), initial_config)
+        previous = {'config': initial_config, 'domain_switch': True,
+                    'certificate': os.readlink(STATE / 'certs/current') if (STATE / 'certs/current').is_symlink() else None,
+                    'metadata': {name: read_json(STATE / name) if (STATE / name).exists() else None
+                                 for name in ('lifecycle.json', 'http-path.json', 'result.json', 'schedule-pending.json')},
+                    **{name: (STATE / name).read_text() if (STATE / name).exists() else None
+                       for name in ('Caddyfile', 'compose.yaml')}}
+        # The stable boot helper must understand this journal before config changes.
+        install_recovery()
+        atomic_json(STATE / 'configuration-transaction.json', previous)
     package_transaction = False
     try:
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        STATE.chmod(0o700)
+        config.setdefault('install_id', uuid.uuid4().hex)
+        config['firewall_effective'] = firewall_plan.get('effective', 'preserve' if config['firewall'] == 'manual' else config['firewall'])
+        if not CONFIG.exists():
+            if config['ca'] == STAGING:
+                trust = STATE / 'staging-trust.pem'
+                shutil.copyfile(config['staging_ca_file'], trust)
+                trust.chmod(0o600)
+                config['staging_ca_file'] = str(trust)
+            atomic_json(CONFIG, config)
+        else:
+            previous = read_json(CONFIG)
+            if not (STATE / 'legacy-config-backup.json').exists():
+                atomic_json(STATE / 'legacy-config-backup.json', previous)
+            if not switching and all((STATE / name).exists() for name in ('Caddyfile', 'compose.yaml')):
+                atomic_json(STATE / 'configuration-transaction.json', {'config': previous,
+                            **{name: (STATE / name).read_text() for name in ('Caddyfile', 'compose.yaml')},
+                            'units': {name: (UNITS / ('tenant-selfsteal-' + name)).read_text()
+                                      for name in ('renew.service', 'renew.timer', 'recover.service')
+                                      if (UNITS / ('tenant-selfsteal-' + name)).exists()}})
+            atomic_json(CONFIG, config)
+        lifecycle_stage('preparing', issuance_authorized=True)
         dependencies()
         if PACKAGE != INSTALL:
             with tempfile.TemporaryDirectory(dir=INSTALL.parent, prefix='tenant-selfsteal-stage-') as staging:
@@ -1722,7 +1783,7 @@ def install(args):
                         if (STATE / name).exists():
                             shutil.copy2(STATE / name, snapshot / name)
                     atomic_json(snapshot / 'units.json', snapshot_units())
-                    atomic_json(snapshot / 'config.json', read_json(CONFIG))
+                    atomic_json(snapshot / 'config.json', initial_config if switching else read_json(CONFIG))
                     # Stable recovery must exist before a possible rename gap.
                     install_recovery()
                     atomic_json(STATE / 'update-transaction.json', {'id': identifier})
@@ -1742,39 +1803,54 @@ def install(args):
             (STATE / 'update-transaction.json').unlink()
             package_transaction = False
         try:
-            firewall_result = firewall.apply(firewall_plan, config, STATE, run, atomic_json)
+            firewall_result = None if switching else firewall.apply(firewall_plan, config, STATE, run, atomic_json)
         except firewall.FirewallError as exc:
             raise Failure(str(exc), exc.code) from exc
         if chosen_template is not None:
             change_template(config, chosen_template, approved=True)
-        if (STATE / 'certs/current').exists():
+        if not switching and (STATE / 'certs/current').exists():
             compose('run', '--rm', '--no-deps', 'caddy', 'caddy', 'validate',
                     '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile')
             compose('up', '-d', '--no-build', 'caddy')
             reload_caddy()
             verify_served(config, validate_certificate(config, STATE / 'certs/current/fullchain.pem', STATE / 'certs/current/key.pem'))
-        (STATE / 'configuration-transaction.json').unlink(missing_ok=True)
+        if not switching:
+            (STATE / 'configuration-transaction.json').unlink(missing_ok=True)
         lifecycle_stage('runtime_ready')
         if firewall_result and firewall_result.get('status') == 'awaiting-confirmation':
             lifecycle_stage('awaiting_firewall')
             print('Откройте НОВОЕ SSH-соединение и в течение 180 секунд выполните:')
             print('sudo transitclient firewall-confirm --confirmation-token ' + firewall_result['token'])
             return
-        if not (STATE / 'certs/current').exists():
+        if switching or not (STATE / 'certs/current').exists():
             try:
                 http_self_test(config, approved=True)
             except Failure as exc:
+                if switching:
+                    raise
                 lifecycle_stage('awaiting_http', reason=exc.code)
                 print('⚠️ Пакет подготовлен. HTTP-путь пока не подтверждён; запрос в CA не отправлен.')
                 print('После исправления маршрута: sudo transitclient self-test --http01, затем sudo transitclient renew.')
                 return
         renew(config)
+        (STATE / 'configuration-transaction.json').unlink(missing_ok=True)
         print('Теперь настройте VPN-ноду и нажмите в боте «Готово, проверить backend».')
     except BaseException:
-        if package_transaction:
-            recover_update()
-        recover_configuration()
+        try:
+            if package_transaction:
+                recover_update()
+        finally:
+            recover_configuration()
         raise
+    if switching:
+        print('✅ Новый домен настроен: ' + config['domain'])
+        print('Проверьте новый домен/SNI и target в VPN-ноде. Правила постоянного firewall сохранены.')
+        try:
+            installation_flow.cleanup_old_data(SimpleNamespace(**globals()), config)
+        except (KeyboardInterrupt, EOFError):
+            print('\nОчистка отменена. Новая установка сохранена.')
+        except (Failure, OSError, ValueError, KeyError, TypeError):
+            print('⚠️ Очистка старых данных остановлена. Новый домен настроен; оставшиеся данные сохранены.')
 
 
 def safe_config():
@@ -2161,6 +2237,8 @@ def update(config, args):
                 raise Failure('Неполный артефакт обновления: отсутствует интерфейс.')
         if tuple(int(part) for part in version.split('.')) >= (1, 5, 0) and not (extracted / 'renewal_schedule.py').is_file():
             raise Failure('Неполный артефакт обновления: отсутствует модуль расписания.')
+        if tuple(int(part) for part in version.split('.')) >= (1, 5, 2) and not (extracted / 'installation_flow.py').is_file():
+            raise Failure('Неполный артефакт обновления: отсутствует модуль повторной установки.')
         deps = read_json(extracted / 'dependencies.json')
         if hashlib.sha256((extracted / 'vendor/acme.sh').read_bytes()).hexdigest() != deps['acme']['sha256']:
             raise Failure('acme.sh в обновлении не соответствует манифесту.')
@@ -2684,6 +2762,18 @@ def _dispatch(args):
 
 def perform(args):
     try:
+        if args.command == 'install' and CONFIG.exists():
+            import installation_flow
+            action = installation_flow.choose_existing(SimpleNamespace(**globals()), args)
+            if action == '0':
+                return 0
+            if action == '1' and not getattr(args, '_menu_mode', False):
+                check_install_resources()
+                if not package_owned():
+                    raise Failure('Принадлежность установленного пакета не подтверждена.', 'OWNERSHIP_UNKNOWN')
+                return subprocess.call([sys.executable, str(INSTALL / 'selfsteal.py'), 'menu',
+                                        *(['--no-color'] if getattr(args, 'no_color', False) else [])])
+            args._new_domain = action == '2'
         return dispatch(args)
     except (Failure, OSError, ValueError, KeyError, TypeError, http.client.HTTPException, subprocess.SubprocessError) as exc:
         if isinstance(exc, Failure) and exc.code == 'CANCELLED':
